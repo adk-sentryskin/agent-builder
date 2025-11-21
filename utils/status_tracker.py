@@ -52,9 +52,16 @@ class StatusTracker:
             "user_id": user_id,
             "status": JobStatus.PENDING,
             "progress": 0,
-            "total_steps": 7,
+            "total_steps": 8,
             "current_step": None,
             "steps": {
+                "create_merchant_record": {
+                    "status": StepStatus.PENDING,
+                    "message": "Creating merchant record in database",
+                    "started_at": None,
+                    "completed_at": None,
+                    "error": None
+                },
                 "create_folders": {
                     "status": StepStatus.PENDING,
                     "message": "Creating folder structure",

@@ -5,6 +5,14 @@ import json
 import logging
 from typing import Optional, List
 from datetime import timedelta
+
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, use system environment variables
+
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -34,21 +42,35 @@ class GCSHandler:
             credentials = self._get_credentials()
             if credentials:
                 self.client = storage.Client(project=self.project_id, credentials=credentials)
+                logger.info("Using service account credentials from environment variables")
             else:
+                logger.warning("No service account credentials found. Attempting to use default credentials.")
+                logger.warning("If this fails, make sure GCS_CLIENT_EMAIL and GCS_PRIVATE_KEY are set in .env file")
                 self.client = storage.Client(project=self.project_id)
+            
             self.bucket = self.client.bucket(self.bucket_name)
             
-            # Try to verify bucket exists, but don't fail if we don't have bucket.get permission
+            # Try to verify bucket exists, but don't fail if we don't have bucket.get permission or credentials
             # The bucket will be created/verified when we actually use it
             try:
                 self.bucket.reload()
                 logger.info(f"Initialized GCS handler for bucket: {self.bucket_name} (verified)")
             except Exception as verify_error:
-                if "storage.buckets.get" in str(verify_error) or "403" in str(verify_error):
+                error_str = str(verify_error)
+                if "storage.buckets.get" in error_str or "403" in error_str:
                     logger.warning(f"Could not verify bucket access (missing storage.buckets.get permission). Bucket operations may still work.")
                     logger.info(f"Initialized GCS handler for bucket: {self.bucket_name} (unverified)")
+                elif "RefreshError" in error_str or "Reauthentication" in error_str:
+                    logger.warning(f"Could not verify bucket (credential issue): {error_str}")
+                    logger.warning("Continuing without verification. Make sure GCS_CLIENT_EMAIL and GCS_PRIVATE_KEY are set in .env file")
+                    logger.warning("Bucket operations will be attempted when actually used.")
+                    logger.info(f"Initialized GCS handler for bucket: {self.bucket_name} (unverified - credential issue)")
+                    # Don't raise - allow initialization to continue
                 else:
-                    raise
+                    logger.warning(f"Could not verify bucket: {error_str}")
+                    logger.warning("Continuing without verification. Bucket will be verified when actually used.")
+                    logger.info(f"Initialized GCS handler for bucket: {self.bucket_name} (unverified)")
+                    # Don't raise - allow initialization to continue
         except Exception as e:
             logger.error(f"Failed to initialize GCS client: {e}")
             raise
@@ -65,6 +87,17 @@ class GCSHandler:
         gcs_private_key = os.getenv("GCS_PRIVATE_KEY")
         gcs_private_key_id = os.getenv("GCS_PRIVATE_KEY_ID")
         gcs_project_id = os.getenv("GCS_PROJECT_ID") or self.project_id
+        
+        # Debug logging
+        if gcs_client_email:
+            logger.info(f"Found GCS_CLIENT_EMAIL: {gcs_client_email}")
+        else:
+            logger.warning("GCS_CLIENT_EMAIL not found in environment")
+        
+        if gcs_private_key:
+            logger.info(f"Found GCS_PRIVATE_KEY (length: {len(gcs_private_key)})")
+        else:
+            logger.warning("GCS_PRIVATE_KEY not found in environment")
         
         if gcs_client_email and gcs_private_key:
             # Clean up the private key (remove quotes and newline escapes)

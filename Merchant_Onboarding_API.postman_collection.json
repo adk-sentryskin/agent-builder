@@ -602,6 +602,190 @@
 			]
 		},
 		{
+			"name": "Merchant Management",
+			"item": [
+				{
+					"name": "Get Merchant",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Get merchant information by merchant_id"
+					},
+					"response": []
+				},
+				{
+					"name": "List Merchants",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/merchants?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "List all merchants for a user"
+					},
+					"response": []
+				},
+				{
+					"name": "Update Merchant",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"shop_name\": \"Updated Shop Name\",\n    \"bot_name\": \"New Bot Name\",\n    \"primary_color\": \"#ff0000\",\n    \"platform\": \"woocommerce\",\n    \"custom_url_pattern\": \"/product/{handle}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Update merchant information. Only provided fields will be updated. Config.json will be automatically regenerated if config-relevant fields are updated. Vertex AI Search datastore will be updated if shop_name or shop_url change."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Merchant Config",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}/config?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}",
+								"config"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Get merchant_config.json content including custom_chatbot fields"
+					},
+					"response": []
+				},
+				{
+					"name": "Update Merchant Config",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"shop_name\": \"Updated Shop Name\",\n    \"custom_field\": \"new value\",\n    \"branding\": {\n        \"primary_color\": \"#ff0000\",\n        \"tertiary_color\": \"#00ff00\"\n    },\n    \"custom_chatbot\": {\n        \"title\": \"Help Assistant\",\n        \"logo_signed_url\": \"https://storage.googleapis.com/...\",\n        \"color\": \"#667eea\",\n        \"font_family\": \"Roboto, sans-serif\",\n        \"tag_line\": \"How can I help you today?\",\n        \"position\": \"bottom-left\"\n    },\n    \"new_section\": {\n        \"field1\": \"value1\",\n        \"field2\": \"value2\"\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}/config?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}",
+								"config"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Update merchant_config.json by merging provided fields with existing config.\n\n⚠️ CRITICAL: This endpoint ONLY updates the merchant_config.json file in GCS.\n\nIt does NOT:\n- ❌ Trigger onboarding process\n- ❌ Re-process products\n- ❌ Re-convert documents\n- ❌ Re-import to Vertex AI Search\n- ❌ Update database records\n- ❌ Re-create folders\n- ❌ Re-generate any other files\n\nIt ONLY:\n- ✅ Updates merchant_config.json file\n- ✅ Merges provided fields with existing config\n- ✅ Preserves all other existing fields\n\nTo re-run full onboarding, use POST /onboard endpoint.\n\nBehavior:\n- Existing fields: Updated with new values (field names preserved)\n- New fields: Added to the config\n- Other fields: All existing fields are automatically preserved\n- Nested objects: Deep merge - updates/adds fields within nested structures\n\nFrontend can send any fields - existing or new. Perfect for updating custom_chatbot fields (title, logo, color, font, tag_line, position) without triggering onboarding."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Merchant",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "⚠️ WARNING: This will permanently delete merchant and all associated data (database record, GCS files, Vertex AI Search datastore, onboarding job history)"
+					},
+					"response": []
+				}
+			]
+		},
+		{
 			"name": "Complete Workflow Example",
 			"item": [
 				{

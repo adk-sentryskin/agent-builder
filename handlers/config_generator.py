@@ -106,6 +106,14 @@ class ConfigGenerator:
                     "secondary_color": secondary_color or "#764ba2",
                     "logo_url": full_logo_url or ""
                 },
+                "custom_chatbot": {
+                    "title": bot_name or "AI Assistant",
+                    "logo_signed_url": full_logo_url or "",
+                    "color": primary_color or "#667eea",
+                    "font_family": "Inter, sans-serif",
+                    "tag_line": "",
+                    "position": "bottom-right"
+                },
                 "metadata": {
                     "created_at": now,
                     "updated_at": now,
@@ -146,4 +154,118 @@ class ConfigGenerator:
         except Exception as e:
             logger.error(f"Error generating config: {e}")
             raise
+
+    def update_config(
+        self,
+        merchant_id: str,
+        new_fields: Dict[str, Any],
+        preserve_existing: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Update merchant_config.json by adding/updating fields while preserving existing ones
+        
+        ⚠️ IMPORTANT: This method ONLY updates the config file.
+        It does NOT trigger onboarding, product processing, or any other operations.
+        
+        Args:
+            merchant_id: Merchant identifier
+            new_fields: Dictionary of new fields to add/update (can be nested)
+            preserve_existing: If True, preserves all existing fields. If False, only updates specified fields.
+        
+        Returns:
+            dict with config path and updated content
+        
+        Example:
+            update_config(
+                merchant_id="merchant-1",
+                new_fields={
+                    "custom_field": "value",
+                    "custom_chatbot": {
+                        "title": "Help Assistant",
+                        "color": "#ff0000"
+                    }
+                }
+            )
+        """
+        try:
+            config_path = f"merchants/{merchant_id}/merchant_config.json"
+            
+            # Try to read existing config
+            existing_config = {}
+            try:
+                if self.gcs_handler.file_exists(config_path):
+                    file_content = self.gcs_handler.download_file(config_path)
+                    existing_config = json.loads(file_content.decode('utf-8'))
+                    logger.info(f"Loaded existing config from {config_path}")
+                else:
+                    logger.warning(f"Config file not found at {config_path}, creating new config")
+            except Exception as e:
+                logger.warning(f"Could not read existing config: {e}, creating new config")
+            
+            # Merge new fields with existing config
+            if preserve_existing:
+                # Deep merge: preserve existing fields, add/update new ones
+                updated_config = self._deep_merge(existing_config.copy(), new_fields)
+            else:
+                # Shallow merge: only update specified fields, remove others
+                updated_config = existing_config.copy()
+                updated_config.update(new_fields)
+            
+            # Update metadata
+            now = datetime.now(timezone.utc).isoformat()
+            if "metadata" not in updated_config:
+                updated_config["metadata"] = {}
+            
+            # Preserve created_at if it exists, update updated_at
+            if "metadata" in existing_config and "created_at" in existing_config["metadata"]:
+                updated_config["metadata"]["created_at"] = existing_config["metadata"]["created_at"]
+            else:
+                updated_config["metadata"]["created_at"] = now
+            
+            updated_config["metadata"]["updated_at"] = now
+            updated_config["metadata"]["version"] = existing_config.get("metadata", {}).get("version", "1.0")
+            
+            # Upload updated config
+            config_content = json.dumps(updated_config, indent=4, ensure_ascii=False)
+            self.gcs_handler.upload_file(
+                config_path,
+                config_content.encode('utf-8'),
+                content_type="application/json"
+            )
+            
+            logger.info(f"Updated config at {config_path} with new fields: {list(new_fields.keys())}")
+            
+            return {
+                "config_path": config_path,
+                "config": updated_config,
+                "added_fields": list(new_fields.keys()),
+                "preserved_existing": preserve_existing
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating config: {e}")
+            raise
+
+    def _deep_merge(self, base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Deep merge two dictionaries, preserving nested structures
+        
+        Args:
+            base: Base dictionary (existing config)
+            update: Dictionary with updates (new fields)
+        
+        Returns:
+            Merged dictionary
+        """
+        result = base.copy()
+        
+        for key, value in update.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                # Recursively merge nested dictionaries
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                # Update or add the field
+                result[key] = value
+        
+        return result
 

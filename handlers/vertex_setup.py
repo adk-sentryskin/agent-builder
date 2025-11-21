@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional
 from google.cloud import discoveryengine_v1 as vertex
 from google.api_core import exceptions as gcp_exceptions
 from google.oauth2 import service_account
+from google.protobuf import field_mask_pb2
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +303,90 @@ class VertexSetup:
         except Exception as e:
             logger.error(f"Error creating datastore: {e}")
             raise
+
+    def update_datastore(
+        self,
+        merchant_id: str,
+        shop_name: Optional[str] = None,
+        shop_url: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Update existing Vertex AI Search datastore
+        
+        Args:
+            merchant_id: Merchant identifier
+            shop_name: New shop name (updates display_name)
+            shop_url: New shop URL (re-registers site for crawling)
+        
+        Returns:
+            dict with update status
+        """
+        try:
+            datastore_id = f"{merchant_id}-engine"
+            parent = f"projects/{self.project_id}/locations/{self.location}/collections/{self.collection_id}"
+            datastore_path = f"{parent}/dataStores/{datastore_id}"
+            
+            # Check if datastore exists
+            try:
+                datastore = self.datastore_client.get_data_store(name=datastore_path)
+            except Exception as e:
+                logger.warning(f"Datastore {datastore_id} not found, cannot update: {e}")
+                return {
+                    "datastore_id": datastore_id,
+                    "status": "not_found",
+                    "message": "Datastore does not exist"
+                }
+            
+            updated = False
+            updates = []
+            
+            # Update display_name if shop_name provided
+            if shop_name and datastore.display_name != shop_name:
+                datastore.display_name = shop_name
+                updated = True
+                updates.append("display_name")
+                logger.info(f"Updating datastore display_name to: {shop_name}")
+            
+            # Update datastore if display_name changed
+            if updated:
+                try:
+                    update_mask = field_mask_pb2.FieldMask(paths=["display_name"])
+                    request = vertex.UpdateDataStoreRequest(
+                        data_store=datastore,
+                        update_mask=update_mask
+                    )
+                    updated_datastore = self.datastore_client.update_data_store(request=request)
+                    logger.info(f"✅ Updated datastore display_name: {updated_datastore.display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to update datastore display_name: {e}")
+                    return {
+                        "datastore_id": datastore_id,
+                        "status": "update_failed",
+                        "error": str(e)
+                    }
+            
+            # Re-register site if shop_url changed
+            if shop_url:
+                try:
+                    self._register_site_for_crawl(datastore_path, shop_url)
+                    updates.append("site_registration")
+                except Exception as e:
+                    logger.warning(f"Failed to re-register site for crawl: {e}")
+                    # Don't fail the whole update if site registration fails
+            
+            return {
+                "datastore_id": datastore_id,
+                "status": "updated" if updated or shop_url else "no_changes",
+                "updated_fields": updates
+            }
+            
+        except Exception as e:
+            logger.error(f"Error updating datastore: {e}")
+            return {
+                "datastore_id": datastore_id,
+                "status": "error",
+                "error": str(e)
+            }
 
     def _register_site_for_crawl(self, datastore_path: str, shop_url: str):
         """

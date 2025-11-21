@@ -163,6 +163,296 @@ Get onboarding progress status.
 }
 ```
 
+### Merchant Management
+
+#### Custom Chatbot Fields
+
+The merchant config includes a `custom_chatbot` section for chatbot customization:
+
+```json
+{
+  "custom_chatbot": {
+    "title": "AI Assistant",              // Chatbot title/name
+    "logo_signed_url": "",                // Signed URL for chatbot logo
+    "color": "#667eea",                   // Primary color for chatbot UI
+    "font_family": "Inter, sans-serif",   // Font family for chatbot text
+    "tag_line": "",                       // Tag line displayed in chatbot
+    "position": "bottom-right"            // Position: bottom-right, bottom-left, top-right, top-left
+  }
+}
+```
+
+These fields can be:
+- **Set during onboarding** (via `bot_name`, `primary_color`, `logo_url`)
+- **Updated via** `PATCH /merchants/{merchant_id}/config` endpoint
+- **Retrieved** from the config file or via `GET /merchants/{merchant_id}`
+
+#### `GET /merchants/{merchant_id}?user_id={user_id}`
+Get merchant information.
+
+**Query Parameters:**
+- `user_id`: User identifier (required for security)
+
+**Response:**
+```json
+{
+  "merchant_id": "merchant-slug",
+  "user_id": "firebase-uid",
+  "shop_name": "My Store",
+  "shop_url": "https://shop.com",
+  "bot_name": "AI Assistant",
+  "status": "active",
+  "created_at": "2024-01-01T00:00:00",
+  "updated_at": "2024-01-01T00:00:00"
+}
+```
+
+#### `GET /merchants?user_id={user_id}`
+List all merchants for a user.
+
+**Query Parameters:**
+- `user_id`: User identifier (required)
+
+**Response:**
+```json
+{
+  "user_id": "firebase-uid",
+  "count": 2,
+  "merchants": [
+    {
+      "merchant_id": "merchant-1",
+      "shop_name": "Store 1",
+      ...
+    },
+    {
+      "merchant_id": "merchant-2",
+      "shop_name": "Store 2",
+      ...
+    }
+  ]
+}
+```
+
+#### `PATCH /merchants/{merchant_id}?user_id={user_id}`
+Update merchant information. Only provided fields will be updated.
+
+**⚠️ IMPORTANT:** This endpoint ONLY updates:
+- Database record
+- `config.json` file (if config-relevant fields changed)
+- Vertex AI Search datastore (if shop_name/shop_url changed)
+
+**It does NOT re-run the full onboarding process:**
+- Does NOT re-process products
+- Does NOT re-convert documents
+- Does NOT re-import to Vertex AI Search
+- Does NOT re-create folders
+
+To re-run full onboarding, use `POST /onboard` endpoint.
+
+**⚠️ Auto-Updates:**
+- **Config Regeneration:** If any config-relevant fields are updated, `config.json` will be automatically regenerated with the new values.
+- **Vertex AI Search:** If `shop_name` or `shop_url` are updated, the Vertex AI Search datastore will be automatically updated:
+  - `shop_name` changes → Updates datastore display name
+  - `shop_url` changes → Re-registers site for website crawling
+
+**Config-relevant fields** (trigger auto-regeneration):
+- `shop_name`, `shop_url`, `bot_name`
+- `primary_color`, `secondary_color`, `logo_url`
+- `target_customer`, `customer_persona`, `bot_tone`, `prompt_text`
+- `top_questions`, `top_products`
+
+**Vertex-relevant fields** (trigger datastore update):
+- `shop_name` - Updates datastore display name
+- `shop_url` - Re-registers site for crawling
+
+**Query Parameters:**
+- `user_id`: User identifier (required for security)
+
+**Request (JSON):**
+```json
+{
+  "shop_name": "Updated Store Name",
+  "bot_name": "New Bot Name",
+  "primary_color": "#ff0000",
+  "platform": "woocommerce",
+  "custom_url_pattern": "/product/{handle}"
+}
+```
+
+**Response:**
+```json
+{
+  "merchant_id": "merchant-slug",
+  "status": "updated",
+  "updated_fields": ["shop_name", "bot_name", "primary_color", "platform", "custom_url_pattern"],
+  "config_regenerated": true,
+  "vertex_datastore_updated": true,
+  "vertex_updated_fields": ["display_name", "site_registration"]
+}
+```
+
+**Notes:**
+- If config regeneration fails, the merchant update will still succeed. Check logs for any config regeneration errors.
+- If Vertex AI Search datastore update fails, the merchant update will still succeed. Check logs for any Vertex update errors.
+- Vertex datastore updates only occur if the datastore exists. If it doesn't exist, the update is skipped (no error).
+
+#### `GET /merchants/{merchant_id}/config?user_id={user_id}`
+Get merchant_config.json content including custom_chatbot fields.
+
+**Query Parameters:**
+- `user_id`: User identifier (required for security)
+
+**Response:**
+```json
+{
+  "merchant_id": "merchant-slug",
+  "config_path": "merchants/merchant-slug/merchant_config.json",
+  "config": {
+    "user_id": "firebase-uid",
+    "merchant_id": "merchant-slug",
+    "shop_name": "My Store",
+    "custom_chatbot": {
+      "title": "AI Assistant",
+      "logo_signed_url": "",
+      "color": "#667eea",
+      "font_family": "Inter, sans-serif",
+      "tag_line": "",
+      "position": "bottom-right"
+    },
+    ...
+  }
+}
+```
+
+#### `PATCH /merchants/{merchant_id}/config?user_id={user_id}`
+Update merchant_config.json by merging provided fields with existing config.
+
+**⚠️ CRITICAL:** This endpoint ONLY updates the `merchant_config.json` file in GCS.
+
+**It does NOT:**
+- ❌ Trigger onboarding process
+- ❌ Re-process products
+- ❌ Re-convert documents
+- ❌ Re-import to Vertex AI Search
+- ❌ Update database records
+- ❌ Re-create folders
+- ❌ Re-generate any other files
+
+**It ONLY:**
+- ✅ Updates merchant_config.json file
+- ✅ Merges provided fields with existing config
+- ✅ Preserves all other existing fields
+
+**To re-run full onboarding, use `POST /onboard` endpoint.**
+
+Perfect for updating `custom_chatbot` fields (title, logo, color, font, tag_line, position) without triggering onboarding.
+
+**Behavior:**
+- **Existing fields**: Updated with new values (field names preserved)
+- **New fields**: Added to the config
+- **Other fields**: All existing fields are automatically preserved
+- **Nested objects**: Deep merge - updates/adds fields within nested structures
+
+**Frontend can send any fields** - existing or new. The endpoint automatically handles merging.
+
+**Query Parameters:**
+- `user_id`: User identifier (required for security)
+
+**Request (JSON):**
+```json
+{
+  "shop_name": "Updated Shop Name",
+  "custom_field": "new value",
+  "branding": {
+    "primary_color": "#ff0000",
+    "tertiary_color": "#00ff00"
+  },
+  "new_section": {
+    "field1": "value1",
+    "field2": "value2"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "merchant_id": "merchant-slug",
+  "status": "updated",
+  "config_path": "merchants/merchant-slug/merchant_config.json",
+  "updated_fields": ["shop_name", "custom_field", "branding", "new_section"]
+}
+```
+
+**Example - Update existing nested field:**
+```json
+// Request
+{
+  "branding": {
+    "primary_color": "#ff0000"
+  }
+}
+
+// Result: Only primary_color updated, secondary_color and other branding fields preserved
+```
+
+**Example - Add new field:**
+```json
+// Request
+{
+  "custom_settings": {
+    "feature_enabled": true,
+    "max_items": 10
+  }
+}
+
+// Result: New custom_settings section added, all existing fields preserved
+```
+
+**Example - Update custom chatbot fields:**
+```json
+// Request
+{
+  "custom_chatbot": {
+    "title": "Help Assistant",
+    "logo_signed_url": "https://storage.googleapis.com/...",
+    "color": "#667eea",
+    "font_family": "Roboto, sans-serif",
+    "tag_line": "How can I help you today?",
+    "position": "bottom-left"
+  }
+}
+
+// Result: Custom chatbot fields updated, all other config fields preserved
+```
+
+**Available chatbot position values:**
+- `bottom-right` (default)
+- `bottom-left`
+- `top-right`
+- `top-left`
+
+#### `DELETE /merchants/{merchant_id}?user_id={user_id}`
+Delete merchant and all associated data.
+
+**⚠️ WARNING:** This will permanently delete:
+- Merchant record from database
+- All files in GCS (products, documents, configs)
+- Vertex AI Search datastore (if exists)
+- All onboarding job history
+
+**Query Parameters:**
+- `user_id`: User identifier (required for security)
+
+**Response:**
+```json
+{
+  "merchant_id": "merchant-slug",
+  "status": "deleted",
+  "message": "Merchant and associated data deleted successfully"
+}
+```
+
 ### Health Check
 
 #### `GET /health`
@@ -357,11 +647,48 @@ Generated `config.json` structure:
 
 ## Logging
 
-The service uses Python's logging module with INFO level by default. Logs include:
-- Request/response information
-- Processing progress
-- Error details
-- GCS and Vertex AI operations
+The service uses Python's logging module with console output. In production (Cloud Run), logs are automatically sent to Google Cloud Logging.
+
+### Log Configuration
+
+**Environment Variables:**
+- `LOG_LEVEL`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Default: `INFO`
+
+### Log Output
+
+- **Local Development**: Logs to console (stdout/stderr)
+- **Production (Cloud Run)**: Logs automatically sent to Google Cloud Logging
+- **Docker**: Logs to stdout/stderr (can be captured by Docker logging)
+
+### Log Format
+
+```
+YYYY-MM-DD HH:MM:SS - logger_name - LEVEL - function_name:line_number - message
+```
+
+Example:
+```
+2024-01-01 12:00:00 - onboarding_api - INFO - start_onboarding:654 - Started onboarding job merchant-slug_1234567890 for merchant merchant-slug
+```
+
+### Viewing Logs
+
+**Local Development:**
+```bash
+# View logs in terminal (stdout)
+# Logs appear directly in console when running uvicorn
+```
+
+**Docker:**
+```bash
+# View container logs
+docker logs -f container-name
+```
+
+**Cloud Run / Production:**
+- Logs are automatically sent to Google Cloud Logging
+- View in Cloud Console: Logging > Logs Explorer
+- Filter by service name: `onboarding-service`
 
 ## License
 
