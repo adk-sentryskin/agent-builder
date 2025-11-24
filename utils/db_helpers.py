@@ -136,7 +136,8 @@ def create_merchant(
         optional_fields = ['target_customer', 'customer_persona', 'bot_tone', 'prompt_text',
                           'top_questions', 'top_products', 
                           'primary_color', 'secondary_color', 'logo_url',
-                          'platform', 'custom_url_pattern']
+                          'platform', 'custom_url_pattern',
+                          'knowledge_base_title', 'knowledge_base_usage_description']
         fields = base_fields.copy()
         values = base_values.copy()
         placeholders = ['%s'] * len(base_fields)

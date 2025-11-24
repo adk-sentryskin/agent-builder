@@ -2,6 +2,12 @@
 
 A standalone FastAPI microservice for merchant onboarding in a multi-merchant chatbot system. This service handles file uploads via signed URLs, processes knowledge base documents and product files, and sets up Vertex AI Search datastores.
 
+## 📚 Documentation
+
+- **[Agent Creation Workflow](./AGENT_CREATION_WORKFLOW.md)** - Complete multi-step workflow guide for creating agents
+- **[Database Schema](./DATABASE_SCHEMA.md)** - Database schema documentation
+- **[Testing Checklist](./TESTING_CHECKLIST.md)** - Comprehensive testing guide
+
 ## Features
 
 - **Signed URL Uploads**: Direct file uploads to Google Cloud Storage (no file size limits)
@@ -30,7 +36,236 @@ onboarding-service/
 └── README.md
 ```
 
+## Quick Start: Agent Creation Workflow
+
+The agent creation process follows a 3-step workflow:
+
+1. **Step 1: Save AI Persona** - `POST /agents/ai-persona`
+   - Configure agent personality, store details, customer persona, system prompt
+   - Merchant ID is auto-generated from Store Name (spaces → hyphens, lowercase)
+
+2. **Step 2: Save Knowledge Base** - `POST /agents/knowledge-base`
+   - Upload files and configure how agent uses them
+   - Set knowledge base title, usage description, top products
+
+3. **Step 3: Create Agent** - `POST /agents/create`
+   - Triggers onboarding with all collected data
+   - Validates Steps 1 & 2 are completed
+
+**See [Agent Creation Workflow](./AGENT_CREATION_WORKFLOW.md) for complete documentation.**
+
+### How Data is Retrieved
+
+- **By User ID**: `GET /merchants?user_id={user_id}` - Returns all merchants for a user
+- **By Merchant ID + User ID**: All single-merchant endpoints require both for security
+  - Backend verifies: `WHERE merchant_id = %s AND user_id = %s`
+  - Ensures users can only access their own merchants
+
+### Merchant ID Generation
+
+Merchant ID is auto-generated from Store Name:
+- Convert to lowercase
+- Replace spaces with hyphens
+- Remove special characters
+- Example: "My Store Name" → `my-store-name`
+
+---
+
 ## API Endpoints
+
+### Agent Creation Workflow
+
+#### `POST /agents/ai-persona`
+Save AI Persona (Step 1) - Build Your Own AI Agent form data.
+
+**Request:**
+```json
+{
+  "merchant_id": "my-store-name",  // Optional - auto-generated if not provided
+  "user_id": "firebase-uid",
+  "agent_name": "Skin Care Assistant",
+  "store_name": "My Store Name",  // Used to generate merchant_id
+  "shop_url": "https://mystore.myshopify.com",
+  "tone_of_voice": "Friendly",
+  "platform": "shopify",
+  "top_questions": ["Question 1", "Question 2", "Question 3"],
+  "top_products": [
+    "https://mystore.com/products/product-1",
+    "https://mystore.com/products/product-2",
+    "https://mystore.com/products/product-3"
+  ],
+  "customer_persona": "Our ideal customer is...",
+  "system_prompt": "System prompt text..."
+}
+```
+
+**Response:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "status": "saved",
+  "ai_persona_saved": true,
+  "message": "AI Persona saved successfully. Proceed to Knowledge Base step."
+}
+```
+
+#### `POST /agents/knowledge-base`
+Save Knowledge Base (Step 2) - Per-file knowledge base information.
+
+**Request:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "user_id": "firebase-uid",
+  "files": [
+    {
+      "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+      "title": "Product Catalog",
+      "usage_description": "This file contains our complete product catalog. Use it to answer questions about product specifications, features, and availability."
+    },
+    {
+      "file_path": "merchants/my-store-name/knowledge_base/faq.pdf",
+      "title": "Frequently Asked Questions",
+      "usage_description": "This file contains common customer questions and answers. Reference it when customers ask about shipping, returns, or general policies."
+    }
+  ]
+}
+```
+
+**Note:** Files must be uploaded first using `/files/upload-url` endpoint. The `file_path` should match the `object_path` returned from the upload URL endpoint.
+
+**How file tagging works:**
+1. **Upload file** → `POST /files/upload-url` returns `object_path` (e.g., `merchants/my-store/knowledge_base/file.pdf`)
+2. **Tag file** → `POST /agents/knowledge-base` with `file_path` (matching `object_path`), `title`, and `usage_description`
+3. The association is stored in the database as JSONB
+
+See [File Upload Workflow](./FILE_UPLOAD_WORKFLOW.md) for detailed documentation.
+
+**Response:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "status": "saved",
+  "knowledge_base_saved": true,
+  "files_count": 2,
+  "message": "Knowledge Base saved successfully with 2 file(s). Ready to create agent."
+}
+```
+
+#### `PUT /agents/knowledge-base`
+Update Knowledge Base (Step 2 - Edit mode).
+
+**Note:** This replaces ALL existing files. To update specific files, use `PATCH /agents/knowledge-base/file`.
+
+#### `GET /agents/{merchant_id}/knowledge-base?user_id={user_id}`
+Get Knowledge Base information with download URLs.
+
+**Response:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "files": [
+    {
+      "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+      "title": "Product Catalog",
+      "usage_description": "This file contains...",
+      "download_url": "https://storage.googleapis.com/...",
+      "download_url_expires_in": 3600,
+      "file_size": 1234567,
+      "content_type": "application/pdf",
+      "filename": "product-catalog.pdf",
+      "uploaded_at": "2024-01-01T00:00:00"
+    }
+  ],
+  "files_count": 1,
+  "knowledge_base_saved": true
+}
+```
+
+#### `PATCH /agents/knowledge-base/file`
+Update a single file's metadata (title and/or usage_description).
+
+**Request:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "user_id": "user-123",
+  "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+  "title": "Updated Product Catalog Title",
+  "usage_description": "Updated description..."
+}
+```
+
+**Response:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "status": "updated",
+  "file": {
+    "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+    "title": "Updated Product Catalog Title",
+    "usage_description": "Updated description..."
+  },
+  "message": "File metadata updated successfully"
+}
+```
+
+**Note:** Only provided fields are updated. Other files are not affected.
+
+#### `DELETE /agents/knowledge-base/file`
+Delete a single file from knowledge base.
+
+**Request:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "user_id": "user-123",
+  "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+  "delete_from_storage": true
+}
+```
+
+**Response:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "status": "deleted",
+  "file_path": "merchants/my-store-name/knowledge_base/product-catalog.pdf",
+  "deleted_from_storage": true,
+  "remaining_files_count": 2,
+  "message": "File deleted successfully. 2 file(s) remaining."
+}
+```
+
+**Note:**
+- `delete_from_storage: true` (default) - Deletes file from both database and GCS
+- `delete_from_storage: false` - Removes from database only, file remains in GCS
+
+#### `POST /agents/create`
+Create Agent (Step 3) - Trigger onboarding with all collected data.
+
+**Request:**
+```json
+{
+  "merchant_id": "my-store-name",
+  "user_id": "firebase-uid"
+}
+```
+
+**Response:**
+```json
+{
+  "job_id": "job-12345",
+  "merchant_id": "my-store-name",
+  "status": "started",
+  "message": "Onboarding started"
+}
+```
+
+#### `GET /agents?user_id={user_id}`
+List all active agents/merchants for a user. Returns merchants with `flow_status` indicating completion of each step.
+
+---
 
 ### File Upload
 
@@ -188,7 +423,7 @@ These fields can be:
 - **Retrieved** from the config file or via `GET /merchants/{merchant_id}`
 
 #### `GET /merchants/{merchant_id}?user_id={user_id}`
-Get merchant information.
+Get merchant information with document download URLs.
 
 **Query Parameters:**
 - `user_id`: User identifier (required for security)
@@ -202,10 +437,32 @@ Get merchant information.
   "shop_url": "https://shop.com",
   "bot_name": "AI Assistant",
   "status": "active",
+  "flow_status": {
+    "ai_persona_saved": true,
+    "knowledge_base_saved": true,
+    "agent_created": true,
+    "onboarding_completed": true
+  },
+  "documents": [
+    {
+      "file_path": "merchants/merchant-slug/knowledge_base/product-catalog.pdf",
+      "title": "Product Catalog",
+      "usage_description": "This file contains our complete product catalog...",
+      "download_url": "https://storage.googleapis.com/...",
+      "download_url_expires_in": 3600,
+      "file_size": 1234567,
+      "content_type": "application/pdf",
+      "filename": "product-catalog.pdf",
+      "uploaded_at": "2024-01-01T00:00:00"
+    }
+  ],
+  "documents_count": 1,
   "created_at": "2024-01-01T00:00:00",
   "updated_at": "2024-01-01T00:00:00"
 }
 ```
+
+**Note:** Download URLs are signed and expire after 60 minutes. Frontend should request new URLs if needed.
 
 #### `GET /merchants?user_id={user_id}`
 List all merchants for a user.

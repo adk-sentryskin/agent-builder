@@ -26,7 +26,7 @@ from utils.status_tracker import StatusTracker, StepStatus
 from utils.db_helpers import (
     get_merchant, create_merchant, update_merchant, delete_merchant, 
     get_user_merchants, verify_merchant_access, update_merchant_onboarding_step,
-    get_connection, return_connection
+    check_subscription, get_connection, return_connection
 )
 
 # Configure logging (console only - production logs go to Cloud Logging/stdout)
@@ -92,8 +92,75 @@ app.add_middleware(
 
 
 # Request/Response Models
+def generate_merchant_id(shop_name: str) -> str:
+    """
+    Generate merchant_id from shop_name
+    - Convert to lowercase
+    - Replace spaces with hyphens
+    - Remove special characters (keep only alphanumeric and hyphens)
+    - Remove consecutive hyphens
+    - Trim hyphens from start/end
+    
+    Example: "My Store Name" -> "my-store-name"
+    """
+    import re
+    # Convert to lowercase
+    merchant_id = shop_name.lower()
+    # Replace spaces and special characters with hyphens
+    merchant_id = re.sub(r'[^a-z0-9]+', '-', merchant_id)
+    # Remove consecutive hyphens
+    merchant_id = re.sub(r'-+', '-', merchant_id)
+    # Trim hyphens from start and end
+    merchant_id = merchant_id.strip('-')
+    return merchant_id
+
+
+class KnowledgeBaseFile(BaseModel):
+    """Knowledge Base File with per-file metadata"""
+    file_path: str = Field(..., description="GCS object path (e.g., merchants/my-store/knowledge_base/file.pdf)")
+    title: str = Field(..., description="Title for this specific file (e.g., Product Catalog)")
+    usage_description: str = Field(..., description="How should your agent use this specific file?")
+
+
+class SaveAIPersonaRequest(BaseModel):
+    """Save AI Persona (Step 1) - Build Your Own AI Agent"""
+    merchant_id: Optional[str] = Field(None, description="Merchant ID (auto-generated from store_name if not provided)")
+    user_id: str
+    agent_name: str = Field(..., description="Agent Name (e.g., Skin Care Assistant)")
+    store_name: str = Field(..., description="Store Name (used to generate merchant_id if not provided)")
+    shop_url: str = Field(..., description="Shop URL")
+    tone_of_voice: Optional[str] = Field(None, description="Tone of Voice (e.g., Friendly)")
+    platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, custom)")
+    top_questions: Optional[List[str]] = Field(None, description="Top-3 Questions (array of 3 questions)")
+    top_products: Optional[List[str]] = Field(None, description="Top-3 product links to sell/promote")
+    customer_persona: Optional[str] = Field(None, description="Describe your ideal customer persona")
+    system_prompt: Optional[str] = Field(None, description="System Prompt for AI Assistant")
+    
+    def get_merchant_id(self) -> str:
+        """Generate merchant_id from store_name if not provided"""
+        if self.merchant_id:
+            return self.merchant_id
+        return generate_merchant_id(self.store_name)
+
+
+class SaveKnowledgeBaseRequest(BaseModel):
+    """Save Knowledge Base (Step 2) - Per-file knowledge base information"""
+    merchant_id: str
+    user_id: str
+    files: List[KnowledgeBaseFile] = Field(..., description="Array of knowledge base files with per-file title and usage_description")
+
+
+class CreateAgentRequest(BaseModel):
+    """Create Agent (Step 3) - Trigger onboarding with all collected data"""
+    merchant_id: str
+    user_id: str
+    # Optional overrides if needed
+    shop_name: Optional[str] = None
+    shop_url: Optional[str] = None
+
+
 class OnboardRequest(BaseModel):
-    """Merchant onboarding request model"""
+    """Merchant onboarding request model (legacy - use CreateAgentRequest for new flow)"""
     merchant_id: str
     user_id: str
     shop_name: str
@@ -610,6 +677,14 @@ async def root():
             "file_upload": "/files/upload-url",
             "file_upload_bulk": "/files/upload-urls",
             "file_confirm": "/files/confirm",
+            "save_ai_persona": "/agents/ai-persona",
+            "save_knowledge_base": "/agents/knowledge-base",
+            "update_knowledge_base": "/agents/knowledge-base (PUT)",
+            "get_knowledge_base": "/agents/{merchant_id}/knowledge-base",
+            "update_knowledge_base_file": "PATCH /agents/knowledge-base/file",
+            "delete_knowledge_base_file": "DELETE /agents/knowledge-base/file",
+            "create_agent": "/agents/create",
+            "list_agents": "/agents",
             "onboard": "/onboard",
             "status": "/onboard-status/{merchant_id}",
             "get_merchant": "/merchants/{merchant_id}",
@@ -621,6 +696,62 @@ async def root():
             "health": "/health"
         }
     }
+
+
+@app.get("/health/gcs")
+async def gcs_health_check():
+    """
+    Check GCS credentials and connectivity
+    
+    Returns:
+    - credentials_loaded: Whether credentials were found
+    - credentials_valid: Whether credentials are valid
+    - bucket_accessible: Whether bucket can be accessed
+    - error: Error message if any
+    """
+    try:
+        result = {
+            "credentials_loaded": False,
+            "credentials_valid": False,
+            "bucket_accessible": False,
+            "bucket_name": gcs_handler.bucket_name if gcs_handler else None,
+            "error": None
+        }
+        
+        if not gcs_handler:
+            result["error"] = "GCS handler not initialized"
+            return result
+        
+        # Check if credentials are loaded
+        try:
+            # Try to access bucket (this will use credentials)
+            test_blob = gcs_handler.bucket.blob("__test_connection__")
+            # Just check if we can create a blob reference (doesn't require actual access)
+            result["credentials_loaded"] = True
+            
+            # Try to list blobs (requires valid credentials)
+            try:
+                list(gcs_handler.bucket.list_blobs(max_results=1))
+                result["credentials_valid"] = True
+                result["bucket_accessible"] = True
+            except Exception as list_error:
+                error_str = str(list_error)
+                if "Reauthentication" in error_str or "RefreshError" in error_str or "credentials" in error_str.lower():
+                    result["error"] = "GCS credentials expired or invalid"
+                else:
+                    result["error"] = f"Bucket access error: {error_str}"
+        except Exception as e:
+            result["error"] = f"Credential check failed: {str(e)}"
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error in GCS health check: {e}")
+        return {
+            "credentials_loaded": False,
+            "credentials_valid": False,
+            "bucket_accessible": False,
+            "error": str(e)
+        }
 
 
 @app.get("/health")
@@ -692,19 +823,29 @@ async def get_upload_url(
     content_type: str = Form(...),
     folder: str = Form(...),
     merchant_id: str = Form(...),
+    user_id: str = Form(...),
     expiration_minutes: int = Form(60)
 ):
     """
     Generate signed URL for direct file upload to GCS
 
     Frontend should:
-    1. Call this endpoint to get signed URL (with merchant_id)
+    1. Call this endpoint to get signed URL (with merchant_id and user_id)
     2. Upload file directly to GCS using PUT request to signed URL
     3. Optionally call /files/confirm to verify upload
 
-    Note: Frontend should validate user owns merchant_id before calling this endpoint
+    Security: Verifies user owns merchant_id before generating upload URL.
+    Note: File uploads are allowed without subscription (for draft/saving purposes).
+    Subscription is checked when creating the agent.
     """
     try:
+        # Verify user owns merchant_id
+        if not verify_merchant_access(merchant_id, user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You don't have permission to upload files for this merchant"
+            )
+        
         url_info = gcs_handler.generate_upload_url(
             merchant_id=merchant_id,
             folder=folder,
@@ -723,6 +864,7 @@ async def get_upload_url(
 @app.post("/files/upload-urls")
 async def get_bulk_upload_urls(
     merchant_id: str = Form(...),
+    user_id: str = Form(...),
     files: str = Form(...)
 ):
     """
@@ -730,13 +872,23 @@ async def get_bulk_upload_urls(
     
     Args:
         merchant_id: Merchant identifier
+        user_id: User identifier (required for security verification)
         files: JSON string with array of file objects:
                [{"folder": "knowledge_base", "filename": "file1.pdf", "content_type": "application/pdf"}, ...]
     
     Returns:
         Array of upload URL objects
+    
+    Security: Verifies user owns merchant_id before generating upload URLs.
     """
     try:
+        # Verify user owns merchant_id
+        if not verify_merchant_access(merchant_id, user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: You don't have permission to upload files for this merchant"
+            )
+        
         import json
         files_list = json.loads(files)
         
@@ -789,6 +941,581 @@ async def confirm_upload(object_path: str = Form(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/agents/ai-persona")
+async def save_ai_persona(request: SaveAIPersonaRequest):
+    """
+    Save AI Persona (Step 1) - Build Your Own AI Agent
+    
+    Saves all AI Persona information to the merchant record.
+    This is Step 1 of the agent creation flow.
+    
+    Note: This endpoint allows saving draft data without subscription check.
+    Subscription is checked when creating the agent (Step 3).
+    
+    Fields from frontend:
+    - Agent Name → bot_name
+    - Store Name → shop_name
+    - Shop URL → shop_url
+    - Tone of Voice → bot_tone
+    - Where is your site hosted? → platform
+    - Top-3 Questions → top_questions (joined as string)
+    - Describe your ideal customer persona → customer_persona
+    - System Prompt → prompt_text
+    
+    Returns:
+    - merchant_id
+    - status: "saved" or "updated"
+    - ai_persona_saved: true
+    """
+    try:
+        # Generate merchant_id from store_name if not provided
+        merchant_id = request.get_merchant_id()
+        
+        # Convert top_questions array to string if provided
+        top_questions_str = None
+        if request.top_questions:
+            top_questions_str = "\n".join(request.top_questions) if isinstance(request.top_questions, list) else request.top_questions
+        
+        # Convert top_products array to string if provided
+        top_products_str = None
+        if request.top_products:
+            top_products_str = "\n".join(request.top_products) if isinstance(request.top_products, list) else request.top_products
+        
+        # Create or update merchant with AI Persona data
+        success = create_merchant(
+            merchant_id=merchant_id,
+            user_id=request.user_id,
+            shop_name=request.store_name,
+            shop_url=request.shop_url,
+            bot_name=request.agent_name,
+            bot_tone=request.tone_of_voice,
+            platform=request.platform,
+            top_questions=top_questions_str,
+            top_products=top_products_str,
+            customer_persona=request.customer_persona,
+            prompt_text=request.system_prompt
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to save AI Persona")
+        
+        # Mark AI Persona as saved
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
+                (merchant_id, request.user_id)
+            )
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            logger.error(f"Error updating ai_persona_saved flag: {e}")
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        logger.info(f"AI Persona saved for merchant: {merchant_id}")
+        
+        return {
+            "merchant_id": merchant_id,
+            "status": "saved",
+            "ai_persona_saved": True,
+            "message": "AI Persona saved successfully. Proceed to Knowledge Base step."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving AI Persona: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agents/knowledge-base")
+async def save_knowledge_base(request: SaveKnowledgeBaseRequest):
+    """
+    Save Knowledge Base (Step 2) - Per-file knowledge base information
+    
+    Saves knowledge base information to the merchant record.
+    This is Step 2 of the agent creation flow.
+    
+    Each file in the knowledge base should have:
+    - file_path: GCS object path (e.g., merchants/my-store/knowledge_base/file.pdf)
+    - title: Title for this specific file (e.g., Product Catalog)
+    - usage_description: How should your agent use this specific file?
+    
+    Note: Files should be uploaded separately using /files/upload-url endpoint
+    before calling this endpoint. The file_path should match the object_path returned
+    from the upload URL endpoint.
+    
+    Returns:
+    - merchant_id
+    - status: "saved" or "updated"
+    - knowledge_base_saved: true
+    - files_count: Number of files saved
+    """
+    try:
+        # Verify merchant access
+        if not verify_merchant_access(request.merchant_id, request.user_id):
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Convert files list to JSON for storage
+        import json
+        knowledge_base_files = [
+            {
+                "file_path": file.file_path,
+                "title": file.title,
+                "usage_description": file.usage_description
+            }
+            for file in request.files
+        ]
+        knowledge_base_files_json = json.dumps(knowledge_base_files)
+        
+        # Update merchant with Knowledge Base data
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            # Update knowledge base fields - store as JSONB
+            cursor.execute(
+                """UPDATE merchants 
+                   SET knowledge_base_files = %s::jsonb,
+                       knowledge_base_saved = TRUE,
+                       updated_at = NOW()
+                   WHERE merchant_id = %s AND user_id = %s
+                   RETURNING merchant_id""",
+                (knowledge_base_files_json, request.merchant_id, request.user_id)
+            )
+            
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            
+            conn.commit()
+            cursor.close()
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving Knowledge Base: {e}")
+            if conn:
+                conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        logger.info(f"Knowledge Base saved for merchant: {request.merchant_id} ({len(request.files)} files)")
+        
+        return {
+            "merchant_id": request.merchant_id,
+            "status": "saved",
+            "knowledge_base_saved": True,
+            "files_count": len(request.files),
+            "message": f"Knowledge Base saved successfully with {len(request.files)} file(s). Ready to create agent."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving Knowledge Base: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/agents/knowledge-base")
+async def update_knowledge_base(request: SaveKnowledgeBaseRequest):
+    """
+    Update Knowledge Base (Step 2 - Edit mode)
+    
+    Updates existing knowledge base information.
+    Replaces all files with the provided files array.
+    
+    Note: This replaces ALL existing files. To update specific files, use PATCH endpoint.
+    To keep existing files, include them in the files array.
+    """
+    return await save_knowledge_base(request)
+
+
+class UpdateKnowledgeBaseFileRequest(BaseModel):
+    """Update a single knowledge base file"""
+    merchant_id: str
+    user_id: str
+    file_path: str = Field(..., description="GCS object path of the file to update")
+    title: Optional[str] = Field(None, description="New title (optional)")
+    usage_description: Optional[str] = Field(None, description="New usage description (optional)")
+
+
+@app.patch("/agents/knowledge-base/file")
+async def update_knowledge_base_file(request: UpdateKnowledgeBaseFileRequest):
+    """
+    Update a single knowledge base file's metadata (title and/or usage_description)
+    
+    This endpoint allows updating individual file metadata without affecting other files.
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier
+        file_path: GCS object path of the file to update
+        title: New title (optional - only updates if provided)
+        usage_description: New usage description (optional - only updates if provided)
+    
+    Returns:
+        Updated file information
+    """
+    try:
+        # Verify merchant access
+        if not verify_merchant_access(request.merchant_id, request.user_id):
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Get current knowledge base files
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        import json
+        knowledge_base_files = []
+        if merchant.get('knowledge_base_files'):
+            if isinstance(merchant['knowledge_base_files'], str):
+                knowledge_base_files = json.loads(merchant['knowledge_base_files'])
+            else:
+                knowledge_base_files = merchant['knowledge_base_files']
+        
+        # Find and update the specific file
+        file_found = False
+        for kb_file in knowledge_base_files:
+            if isinstance(kb_file, dict) and kb_file.get('file_path') == request.file_path:
+                # Update only provided fields
+                if request.title is not None:
+                    kb_file['title'] = request.title
+                if request.usage_description is not None:
+                    kb_file['usage_description'] = request.usage_description
+                file_found = True
+                break
+        
+        if not file_found:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found in knowledge base: {request.file_path}"
+            )
+        
+        # Save updated files back to database
+        knowledge_base_files_json = json.dumps(knowledge_base_files)
+        
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                """UPDATE merchants 
+                   SET knowledge_base_files = %s::jsonb,
+                       updated_at = NOW()
+                   WHERE merchant_id = %s AND user_id = %s
+                   RETURNING merchant_id""",
+                (knowledge_base_files_json, request.merchant_id, request.user_id)
+            )
+            
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            
+            conn.commit()
+            cursor.close()
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating knowledge base file: {e}")
+            if conn:
+                conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        # Find the updated file to return
+        updated_file = next(
+            (f for f in knowledge_base_files if isinstance(f, dict) and f.get('file_path') == request.file_path),
+            None
+        )
+        
+        logger.info(f"Updated knowledge base file: {request.file_path} for merchant: {request.merchant_id}")
+        
+        return {
+            "merchant_id": request.merchant_id,
+            "status": "updated",
+            "file": updated_file,
+            "message": "File metadata updated successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating knowledge base file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DeleteKnowledgeBaseFileRequest(BaseModel):
+    """Delete a knowledge base file"""
+    merchant_id: str
+    user_id: str
+    file_path: str = Field(..., description="GCS object path of the file to delete")
+    delete_from_storage: bool = Field(True, description="Whether to delete the file from GCS storage (default: true)")
+
+
+@app.delete("/agents/knowledge-base/file")
+async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
+    """
+    Delete a single knowledge base file
+    
+    This endpoint:
+    1. Removes the file from knowledge base metadata (database)
+    2. Optionally deletes the file from GCS storage
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier
+        file_path: GCS object path of the file to delete
+        delete_from_storage: Whether to delete from GCS (default: true)
+    
+    Returns:
+        Deletion status
+    """
+    try:
+        # Verify merchant access
+        if not verify_merchant_access(request.merchant_id, request.user_id):
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Get current knowledge base files
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        import json
+        knowledge_base_files = []
+        if merchant.get('knowledge_base_files'):
+            if isinstance(merchant['knowledge_base_files'], str):
+                knowledge_base_files = json.loads(merchant['knowledge_base_files'])
+            else:
+                knowledge_base_files = merchant['knowledge_base_files']
+        
+        # Remove the file from the list
+        original_count = len(knowledge_base_files)
+        knowledge_base_files = [
+            f for f in knowledge_base_files
+            if isinstance(f, dict) and f.get('file_path') != request.file_path
+        ]
+        
+        if len(knowledge_base_files) == original_count:
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found in knowledge base: {request.file_path}"
+            )
+        
+        # Delete from GCS if requested
+        gcs_deleted = False
+        if request.delete_from_storage:
+            try:
+                gcs_handler.delete_file(request.file_path)
+                gcs_deleted = True
+            except FileNotFoundError:
+                logger.warning(f"File not found in GCS (may have been deleted already): {request.file_path}")
+            except Exception as e:
+                logger.warning(f"Error deleting file from GCS: {e}. Continuing with metadata removal.")
+        
+        # Save updated files back to database
+        knowledge_base_files_json = json.dumps(knowledge_base_files)
+        
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                """UPDATE merchants 
+                   SET knowledge_base_files = %s::jsonb,
+                       updated_at = NOW()
+                   WHERE merchant_id = %s AND user_id = %s
+                   RETURNING merchant_id""",
+                (knowledge_base_files_json, request.merchant_id, request.user_id)
+            )
+            
+            result = cursor.fetchone()
+            if not result:
+                raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            
+            conn.commit()
+            cursor.close()
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting knowledge base file: {e}")
+            if conn:
+                conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        logger.info(f"Deleted knowledge base file: {request.file_path} for merchant: {request.merchant_id}")
+        
+        return {
+            "merchant_id": request.merchant_id,
+            "status": "deleted",
+            "file_path": request.file_path,
+            "deleted_from_storage": gcs_deleted,
+            "remaining_files_count": len(knowledge_base_files),
+            "message": f"File deleted successfully. {len(knowledge_base_files)} file(s) remaining."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting knowledge base file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agents/create")
+async def create_agent(
+    request: CreateAgentRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Create Agent (Step 3) - Trigger onboarding with all collected data
+    
+    This endpoint:
+    1. Checks if user has active subscription (REQUIRED)
+    2. Validates that AI Persona (Step 1) is saved
+    3. Validates that Knowledge Base (Step 2) is saved
+    4. Retrieves all saved data from database
+    5. Triggers onboarding process with all collected information
+    6. If any required fields are missing, returns error with missing fields list
+    
+    Required fields validation:
+    - shop_name (from AI Persona)
+    - shop_url (from AI Persona)
+    - agent_name/bot_name (from AI Persona)
+    
+    Returns:
+    - job_id
+    - merchant_id
+    - status: "started" or "validation_failed"
+    - missing_fields: list of missing required fields (if validation fails)
+    """
+    try:
+        # Check if user has active subscription
+        if not check_subscription(request.user_id):
+            raise HTTPException(
+                status_code=402,
+                detail="Active subscription required to create agents. Please upgrade your plan."
+            )
+        
+        # Get merchant from database
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        # Validate steps are completed
+        if not merchant.get('ai_persona_saved'):
+            raise HTTPException(
+                status_code=400,
+                detail="AI Persona (Step 1) not saved. Please complete Step 1 first.",
+                missing_step="ai_persona"
+            )
+        
+        if not merchant.get('knowledge_base_saved'):
+            raise HTTPException(
+                status_code=400,
+                detail="Knowledge Base (Step 2) not saved. Please complete Step 2 first.",
+                missing_step="knowledge_base"
+            )
+        
+        # Collect all data from merchant record
+        shop_name = request.shop_name or merchant.get('shop_name')
+        shop_url = request.shop_url or merchant.get('shop_url')
+        bot_name = merchant.get('bot_name', 'AI Assistant')
+        
+        # Validate required fields
+        missing_fields = []
+        if not shop_name:
+            missing_fields.append("shop_name")
+        if not shop_url:
+            missing_fields.append("shop_url")
+        if not bot_name:
+            missing_fields.append("bot_name")
+        
+        if missing_fields:
+            return {
+                "merchant_id": request.merchant_id,
+                "status": "validation_failed",
+                "missing_fields": missing_fields,
+                "message": f"Missing required fields: {', '.join(missing_fields)}"
+            }
+        
+        # Mark agent as created
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE merchants SET agent_created = TRUE, updated_at = NOW() WHERE merchant_id = %s",
+                (request.merchant_id,)
+            )
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            logger.warning(f"Error updating agent_created flag: {e}")
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        # Extract file paths from knowledge_base_files JSONB
+        import json
+        knowledge_base_files = []
+        file_paths_dict = {"knowledge": []}
+        
+        if merchant.get('knowledge_base_files'):
+            if isinstance(merchant['knowledge_base_files'], str):
+                knowledge_base_files = json.loads(merchant['knowledge_base_files'])
+            else:
+                knowledge_base_files = merchant['knowledge_base_files']
+            
+            # Extract file paths for onboarding
+            for kb_file in knowledge_base_files:
+                if isinstance(kb_file, dict) and 'file_path' in kb_file:
+                    file_paths_dict["knowledge"].append(kb_file['file_path'])
+        
+        # Create OnboardRequest with all collected data
+        onboard_request = OnboardRequest(
+            merchant_id=request.merchant_id,
+            user_id=request.user_id,
+            shop_name=shop_name,
+            shop_url=shop_url,
+            bot_name=bot_name,
+            target_customer=merchant.get('target_customer'),
+            customer_persona=merchant.get('customer_persona'),
+            bot_tone=merchant.get('bot_tone'),
+            prompt_text=merchant.get('prompt_text'),
+            top_questions=merchant.get('top_questions'),
+            top_products=merchant.get('top_products'),
+            platform=merchant.get('platform'),
+            custom_url_pattern=merchant.get('custom_url_pattern'),
+            file_paths=file_paths_dict if file_paths_dict["knowledge"] else None
+        )
+        
+        # Start onboarding
+        return await start_onboarding(onboard_request, background_tasks)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/onboard")
 async def start_onboarding(
     request: OnboardRequest,
@@ -799,8 +1526,16 @@ async def start_onboarding(
 
     This endpoint accepts merchant information and file paths (not files themselves).
     Files should be uploaded first using the /files/upload-url endpoint.
+    
+    Note: Requires active subscription to start onboarding.
     """
     try:
+        # Check if user has active subscription
+        if not check_subscription(request.user_id):
+            raise HTTPException(
+                status_code=402,
+                detail="Active subscription required to start onboarding. Please upgrade your plan."
+            )
         # Create job in status tracker
         job_id = status_tracker.create_job(request.merchant_id, request.user_id)
 
@@ -846,7 +1581,6 @@ async def get_onboarding_status(merchant_id: str):
     Get onboarding progress status
     
     Returns both in-memory status (current job progress) and database status (persistent step completion).
-    """
     """
     try:
         # Get in-memory status (current job progress)
@@ -933,7 +1667,6 @@ async def get_onboarding_status(merchant_id: str):
 # Merchant Management Endpoints
 
 class UpdateMerchantRequest(BaseModel):
-    """Merchant update request model"""
     shop_name: Optional[str] = None
     shop_url: Optional[str] = None
     bot_name: Optional[str] = None
@@ -953,7 +1686,14 @@ class UpdateMerchantRequest(BaseModel):
 @app.get("/merchants/{merchant_id}")
 async def get_merchant_info(merchant_id: str, user_id: str):
     """
-    Get merchant information
+    Get merchant/agent information with document details
+    
+    Returns complete merchant data including:
+    - AI Persona information (Step 1)
+    - Knowledge Base information (Step 2) with download URLs
+    - Document information (files uploaded with download URLs)
+    - Onboarding status
+    - Flow completion status
     
     Args:
         merchant_id: Merchant identifier
@@ -967,6 +1707,86 @@ async def get_merchant_info(merchant_id: str, user_id: str):
                 detail="Merchant not found or you don't have access"
             )
         
+        # Add flow status
+        merchant['flow_status'] = {
+            'ai_persona_saved': merchant.get('ai_persona_saved', False),
+            'knowledge_base_saved': merchant.get('knowledge_base_saved', False),
+            'agent_created': merchant.get('agent_created', False),
+            'onboarding_completed': merchant.get('step_onboarding_completed', False)
+        }
+        
+        # Get knowledge base files with download URLs
+        import json
+        knowledge_base_files = []
+        if merchant.get('knowledge_base_files'):
+            if isinstance(merchant['knowledge_base_files'], str):
+                knowledge_base_files = json.loads(merchant['knowledge_base_files'])
+            else:
+                knowledge_base_files = merchant['knowledge_base_files']
+        
+        # Add download URLs and file metadata to each knowledge base file
+        documents = []
+        for kb_file in knowledge_base_files:
+            file_path = kb_file.get('file_path') if isinstance(kb_file, dict) else None
+            if file_path:
+                # Generate download URL (now handles errors gracefully)
+                download_info = gcs_handler.generate_download_url(file_path, expiration_minutes=60)
+                
+                # Combine knowledge base metadata with file info
+                doc_info = {
+                    "file_path": file_path,
+                    "title": kb_file.get('title', '') if isinstance(kb_file, dict) else '',
+                    "usage_description": kb_file.get('usage_description', '') if isinstance(kb_file, dict) else '',
+                    "download_url": download_info.get('download_url'),
+                    "download_url_expires_in": download_info.get('expires_in'),
+                    "file_size": download_info.get('file_size'),
+                    "content_type": download_info.get('content_type'),
+                    "filename": download_info.get('filename'),
+                    "uploaded_at": download_info.get('uploaded_at')
+                }
+                
+                # Add error if download URL generation failed
+                if download_info.get('error'):
+                    doc_info["error"] = download_info.get('error')
+                
+                documents.append(doc_info)
+        
+        # Also check for any other files in knowledge_base folder that might not be in metadata
+        try:
+            knowledge_base_folder = f"merchants/{merchant_id}/knowledge_base"
+            all_files = gcs_handler.list_files_in_folder(knowledge_base_folder)
+            
+            # Add files that exist in GCS but not in metadata
+            existing_paths = {doc['file_path'] for doc in documents}
+            for file_info in all_files:
+                if file_info['file_path'] not in existing_paths:
+                    # File exists but not in metadata - add it with basic info
+                    try:
+                        download_info = gcs_handler.generate_download_url(
+                            file_info['file_path'], 
+                            expiration_minutes=60
+                        )
+                        documents.append({
+                            "file_path": file_info['file_path'],
+                            "title": file_info['filename'],  # Use filename as title if no metadata
+                            "usage_description": "",  # No description available
+                            "download_url": download_info.get('download_url'),
+                            "download_url_expires_in": download_info.get('expires_in'),
+                            "file_size": download_info.get('file_size'),
+                            "content_type": download_info.get('content_type'),
+                            "filename": download_info.get('filename'),
+                            "uploaded_at": download_info.get('uploaded_at'),
+                            "metadata_missing": True  # Flag to indicate this file has no metadata
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error adding file {file_info['file_path']}: {e}")
+        except Exception as e:
+            logger.warning(f"Error listing files in knowledge_base folder: {e}")
+        
+        # Add documents array to response
+        merchant['documents'] = documents
+        merchant['documents_count'] = len(documents)
+        
         return merchant
     
     except HTTPException:
@@ -977,15 +1797,36 @@ async def get_merchant_info(merchant_id: str, user_id: str):
 
 
 @app.get("/merchants")
-async def list_merchants(user_id: str):
+async def list_merchants(user_id: str, status: Optional[str] = None):
     """
-    List all merchants for a user
+    List all merchants/agents for a user (Active Merchants/Agents)
+    
+    Returns merchants with their current status:
+    - draft: AI Persona or Knowledge Base saved but agent not created
+    - active: Agent created and onboarding completed
+    - onboarding: Onboarding in progress
+    - error: Onboarding failed
     
     Args:
         user_id: User identifier (query parameter)
+        status: Optional filter by status (active, draft, onboarding, error)
     """
     try:
         merchants = get_user_merchants(user_id)
+        
+        # Filter by status if provided
+        if status:
+            merchants = [m for m in merchants if m.get('status') == status or m.get('onboarding_status') == status]
+        
+        # Add flow status information
+        for merchant in merchants:
+            merchant['flow_status'] = {
+                'ai_persona_saved': merchant.get('ai_persona_saved', False),
+                'knowledge_base_saved': merchant.get('knowledge_base_saved', False),
+                'agent_created': merchant.get('agent_created', False),
+                'onboarding_completed': merchant.get('step_onboarding_completed', False)
+            }
+        
         return {
             "user_id": user_id,
             "count": len(merchants),
@@ -994,6 +1835,84 @@ async def list_merchants(user_id: str):
     
     except Exception as e:
         logger.error(f"Error listing merchants: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/agents")
+async def list_agents(user_id: str):
+    """
+    List all active agents for a user (alias for /merchants)
+    
+    This endpoint returns the same data as /merchants but is named
+    "agents" to match frontend terminology.
+    """
+    return await list_merchants(user_id, status=None)
+
+
+@app.get("/agents/{merchant_id}/knowledge-base")
+async def get_knowledge_base(merchant_id: str, user_id: str):
+    """
+    Get Knowledge Base information for an agent with download URLs
+    
+    Returns:
+    - files: Array of knowledge base files with per-file title, usage_description, and download URLs
+    - knowledge_base_saved status
+    
+    Args:
+        merchant_id: Merchant/Agent identifier
+        user_id: User identifier (query parameter for security)
+    """
+    try:
+        merchant = get_merchant(merchant_id, user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        # Get knowledge base files from JSONB column
+        import json
+        knowledge_base_files = []
+        if merchant.get('knowledge_base_files'):
+            if isinstance(merchant['knowledge_base_files'], str):
+                knowledge_base_files = json.loads(merchant['knowledge_base_files'])
+            else:
+                knowledge_base_files = merchant['knowledge_base_files']
+        
+        # Add download URLs and file metadata to each file
+        files_with_downloads = []
+        for kb_file in knowledge_base_files:
+            file_path = kb_file.get('file_path') if isinstance(kb_file, dict) else None
+            if file_path:
+                # Generate download URL (now handles errors gracefully)
+                download_info = gcs_handler.generate_download_url(file_path, expiration_minutes=60)
+                
+                file_data = {
+                    "file_path": file_path,
+                    "title": kb_file.get('title', '') if isinstance(kb_file, dict) else '',
+                    "usage_description": kb_file.get('usage_description', '') if isinstance(kb_file, dict) else '',
+                    "download_url": download_info.get('download_url'),
+                    "download_url_expires_in": download_info.get('expires_in'),
+                    "file_size": download_info.get('file_size'),
+                    "content_type": download_info.get('content_type'),
+                    "filename": download_info.get('filename'),
+                    "uploaded_at": download_info.get('uploaded_at')
+                }
+                
+                # Add error if download URL generation failed
+                if download_info.get('error'):
+                    file_data["error"] = download_info.get('error')
+                
+                files_with_downloads.append(file_data)
+        
+        return {
+            "merchant_id": merchant_id,
+            "files": files_with_downloads,
+            "files_count": len(files_with_downloads),
+            "knowledge_base_saved": merchant.get('knowledge_base_saved', False)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting knowledge base: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

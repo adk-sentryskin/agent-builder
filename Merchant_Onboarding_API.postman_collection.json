@@ -89,6 +89,12 @@
 									"type": "text"
 								},
 								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
+								},
+								{
 									"key": "folder",
 									"value": "knowledge_base",
 									"type": "text",
@@ -121,7 +127,7 @@
 								"upload-url"
 							]
 						},
-						"description": "Get signed URL for uploading a knowledge base document (PDF, DOCX, TXT, HTML)"
+						"description": "Get signed URL for uploading a knowledge base document (PDF, DOCX, TXT, HTML)\n\n**Security:** Requires `user_id` to verify user owns `merchant_id`.\n\n**Note:** File uploads are allowed without subscription (for draft/saving purposes). Subscription is checked when creating the agent (Step 3)."
 					},
 					"response": []
 				},
@@ -203,6 +209,12 @@
 									"type": "text"
 								},
 								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
+								},
+								{
 									"key": "folder",
 									"value": "prompt-docs",
 									"type": "text"
@@ -234,7 +246,7 @@
 								"upload-url"
 							]
 						},
-						"description": "Get signed URL for uploading products CSV/XLSX file"
+						"description": "Get signed URL for uploading products CSV/XLSX file\n\n**Security:** Requires `user_id` to verify user owns `merchant_id`.\n\n**Note:** File uploads are allowed without subscription (for draft/saving purposes). Subscription is checked when creating the agent (Step 3)."
 					},
 					"response": []
 				},
@@ -313,6 +325,12 @@
 									"key": "merchant_id",
 									"value": "{{merchant_id}}",
 									"type": "text"
+								},
+								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
 								},
 								{
 									"key": "folder",
@@ -434,6 +452,12 @@
 									"type": "text"
 								},
 								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
+								},
+								{
 									"key": "files",
 									"value": "[{\"folder\":\"knowledge_base\",\"filename\":\"faq.pdf\",\"content_type\":\"application/pdf\"},{\"folder\":\"knowledge_base\",\"filename\":\"manual.docx\",\"content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"}]",
 									"type": "text",
@@ -451,7 +475,7 @@
 								"upload-urls"
 							]
 						},
-						"description": "Generate multiple signed URLs for bulk file uploads.\n\n**Usage:**\n1. Provide merchant_id\n2. Provide files as JSON array: [{\"folder\":\"knowledge_base\",\"filename\":\"file1.pdf\",\"content_type\":\"application/pdf\"}, ...]\n3. Response contains array of upload URLs\n4. Upload each file to its respective signed URL using PUT request\n\n**Example files JSON:**\n```json\n[\n  {\"folder\":\"knowledge_base\",\"filename\":\"faq.pdf\",\"content_type\":\"application/pdf\"},\n  {\"folder\":\"knowledge_base\",\"filename\":\"manual.docx\",\"content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"},\n  {\"folder\":\"prompt-docs\",\"filename\":\"products.csv\",\"content_type\":\"text/csv\"}\n]\n```"
+						"description": "Generate multiple signed URLs for bulk file uploads.\n\n**Security:** Requires `user_id` to verify user owns `merchant_id`.\n\n**Usage:**\n1. Provide merchant_id and user_id\n2. Provide files as JSON array: [{\"folder\":\"knowledge_base\",\"filename\":\"file1.pdf\",\"content_type\":\"application/pdf\"}, ...]\n3. Response contains array of upload URLs\n4. Upload each file to its respective signed URL using PUT request\n\n**Note:** File uploads are allowed without subscription (for draft/saving purposes). Subscription is checked when creating the agent (Step 3).\n\n**Example files JSON:**\n```json\n[\n  {\"folder\":\"knowledge_base\",\"filename\":\"faq.pdf\",\"content_type\":\"application/pdf\"},\n  {\"folder\":\"knowledge_base\",\"filename\":\"manual.docx\",\"content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"},\n  {\"folder\":\"prompt-docs\",\"filename\":\"products.csv\",\"content_type\":\"text/csv\"}\n]\n```"
 					},
 					"response": []
 				},
@@ -556,7 +580,7 @@
 								"onboard"
 							]
 						},
-						"description": "Start the merchant onboarding process. This will:\n1. Create folder structure\n2. Process products file (auto-detected from knowledge_base)\n3. Process categories file (auto-detected from knowledge_base)\n4. Convert documents\n5. Setup Vertex AI Search datastore (with website crawling if shop_url provided)\n6. Generate merchant config\n\nRequired fields: merchant_id, user_id, shop_name, shop_url\nOptional fields: bot_name, target_customer, customer_persona, bot_tone, prompt_text, top_questions, top_products, primary_color, secondary_color, logo_url, platform, custom_url_pattern\n\nPlatform options: 'shopify' (default), 'woocommerce', 'wordpress', 'custom'\nIf platform is 'custom', provide custom_url_pattern (e.g., '/item/{handle}' or '/p/{handle}')\nIf custom_url_pattern is provided, it will be used regardless of platform setting.\n\nNote: Files should be uploaded first using /files/upload-url endpoint. Products and categories files are auto-detected from the knowledge_base folder."
+						"description": "Start the merchant onboarding process.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription in `billing.user_subscriptions` table\n- Returns `402 Payment Required` if no active subscription\n- Error: \"Active subscription required to start onboarding. Please upgrade your plan.\"\n\n**This will:**\n1. Create folder structure\n2. Process products file (auto-detected from knowledge_base)\n3. Process categories file (auto-detected from knowledge_base)\n4. Convert documents\n5. Setup Vertex AI Search datastore (with website crawling if shop_url provided)\n6. Generate merchant config\n\n**Required fields:** merchant_id, user_id, shop_name, shop_url\n**Optional fields:** bot_name, target_customer, customer_persona, bot_tone, prompt_text, top_questions, top_products, primary_color, secondary_color, logo_url, platform, custom_url_pattern\n\n**Platform options:** 'shopify' (default), 'woocommerce', 'wordpress', 'custom'\nIf platform is 'custom', provide custom_url_pattern (e.g., '/item/{handle}' or '/p/{handle}')\nIf custom_url_pattern is provided, it will be used regardless of platform setting.\n\n**Note:** Files should be uploaded first using /files/upload-url endpoint. Products and categories files are auto-detected from the knowledge_base folder."
 					},
 					"response": []
 				},
@@ -625,7 +649,7 @@
 								}
 							]
 						},
-						"description": "Get merchant information by merchant_id"
+						"description": "Get merchant information with document download URLs.\n\n**Returns:**\n- Complete merchant data (AI Persona, Knowledge Base, etc.)\n- `documents`: Array of uploaded documents with:\n  - `file_path`, `title`, `usage_description`\n  - `download_url`: Signed URL for downloading (expires in 60 min)\n  - `file_size`, `content_type`, `filename`, `uploaded_at`\n- `documents_count`: Number of documents\n\n**Frontend Usage:** Display documents list with download buttons."
 					},
 					"response": []
 				},
@@ -786,6 +810,348 @@
 			]
 		},
 		{
+			"name": "Agent Creation Workflow (Multi-Step)",
+			"item": [
+				{
+					"name": "Step 1: Save AI Persona",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"Status code is 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"",
+									"pm.test(\"AI Persona saved\", function () {",
+									"    var jsonData = pm.response.json();",
+									"    pm.expect(jsonData).to.have.property('merchant_id');",
+									"    pm.expect(jsonData).to.have.property('ai_persona_saved', true);",
+									"    pm.environment.set(\"merchant_id\", jsonData.merchant_id);",
+									"});"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"user_id\": \"{{user_id}}\",\n    \"agent_name\": \"Skin Care Assistant\",\n    \"store_name\": \"My Store Name\",\n    \"shop_url\": \"https://mystore.myshopify.com\",\n    \"tone_of_voice\": \"Friendly\",\n    \"platform\": \"shopify\",\n    \"top_questions\": [\n        \"Is your hair curly?\",\n        \"Is your skin oily or dry?\",\n        \"Are you a male or female?\"\n    ],\n    \"top_products\": [\n        \"https://mystore.com/products/product-1\",\n        \"https://mystore.com/products/product-2\",\n        \"https://mystore.com/products/product-3\"\n    ],\n    \"customer_persona\": \"Our ideal customer is a tech-driven business owner or marketing professional seeking to automate customer interactions, generate leads, and improve engagement through AI-powered solutions.\",\n    \"system_prompt\": \"Enter the system prompt for your AI Assistant. This defines how the assistant should behave, what it should know about your business and how it should interact with customers...\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/ai-persona",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"ai-persona"
+							]
+						},
+						"description": "**Step 1: Save AI Persona**\n\nSaves all AI Persona configuration (Build Your Own AI Agent form).\n\n**Note:** This endpoint allows saving draft data without subscription check. Subscription is checked when creating the agent (Step 3).\n\n**Fields:**\n- `merchant_id`: Optional - auto-generated from `store_name` if not provided\n- `store_name`: Used to generate merchant_id (spaces → hyphens, lowercase)\n- `agent_name`: Agent Name (e.g., Skin Care Assistant)\n- `shop_url`: Shop URL\n- `tone_of_voice`: Tone of Voice (e.g., Friendly)\n- `platform`: shopify, woocommerce, wordpress, custom\n- `top_questions`: Array of 3 questions\n- `top_products`: Array of top-3 product links to sell/promote\n- `customer_persona`: Describe your ideal customer persona\n- `system_prompt`: System Prompt for AI Assistant\n\n**Response:** Returns `merchant_id` (auto-generated if not provided) and `ai_persona_saved: true`"
+					},
+					"response": []
+				},
+				{
+					"name": "Step 2: Save Knowledge Base",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"Status code is 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"",
+									"pm.test(\"Knowledge Base saved\", function () {",
+									"    var jsonData = pm.response.json();",
+									"    pm.expect(jsonData).to.have.property('merchant_id');",
+									"    pm.expect(jsonData).to.have.property('knowledge_base_saved', true);",
+									"    pm.expect(jsonData).to.have.property('files_count');",
+									"});"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"files\": [\n        {\n            \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/product-catalog.pdf\",\n            \"title\": \"Product Catalog\",\n            \"usage_description\": \"This file contains our complete product catalog. Use it to answer questions about product specifications, features, and availability.\"\n        },\n        {\n            \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/faq.pdf\",\n            \"title\": \"Frequently Asked Questions\",\n            \"usage_description\": \"This file contains common customer questions and answers. Reference it when customers ask about shipping, returns, or general policies.\"\n        },\n        {\n            \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/brand-guidelines.pdf\",\n            \"title\": \"Brand Guidelines\",\n            \"usage_description\": \"This file contains our brand voice and messaging guidelines. Use it to maintain consistent tone and messaging in all customer interactions.\"\n        }\n    ]\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/knowledge-base",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"knowledge-base"
+							]
+						},
+						"description": "**Step 2: Save Knowledge Base**\n\nSaves per-file knowledge base information. Each file in the knowledge base should have its own title and usage description.\n\n**Note:** This endpoint allows saving draft data without subscription check. Subscription is checked when creating the agent (Step 3).\n\n**Important:** Files must be uploaded first using `/files/upload-url` endpoint to `knowledge_base` folder. The `file_path` should match the `object_path` returned from the upload URL endpoint.\n\n**Fields:**\n- `merchant_id`: Merchant ID from Step 1\n- `user_id`: User identifier\n- `files`: Array of knowledge base files, each with:\n  - `file_path`: GCS object path (e.g., `merchants/my-store/knowledge_base/file.pdf`)\n  - `title`: Title for this specific file (e.g., \"Product Catalog\")\n  - `usage_description`: How should your agent use this specific file?\n\n**Response:** Returns `merchant_id`, `knowledge_base_saved: true`, and `files_count`"
+					},
+					"response": []
+				},
+				{
+					"name": "Step 2: Update Knowledge Base (Edit)",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"files\": [\n        {\n            \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/product-catalog.pdf\",\n            \"title\": \"Updated Product Catalog\",\n            \"usage_description\": \"Updated description of how agent should use this file...\"\n        },\n        {\n            \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/new-file.pdf\",\n            \"title\": \"New Knowledge Base File\",\n            \"usage_description\": \"Description for the new file...\"\n        }\n    ]\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/knowledge-base",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"knowledge-base"
+							]
+						},
+						"description": "**Step 2: Update Knowledge Base (Edit Mode)**\n\nUpdates existing knowledge base information. Same as POST but allows editing.\n\nUse this endpoint when user clicks \"Edit\" on the Knowledge Base page."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Knowledge Base",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/agents/{{merchant_id}}/knowledge-base?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"{{merchant_id}}",
+								"knowledge-base"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Get Knowledge Base information for an agent with download URLs.\n\n**Returns:**\n- `files`: Array of knowledge base files, each with:\n  - `file_path`: GCS object path\n  - `title`: Title for this file\n  - `usage_description`: How agent should use this file\n  - `download_url`: Signed URL for downloading the file (expires in 60 minutes)\n  - `download_url_expires_in`: Seconds until download URL expires\n  - `file_size`: File size in bytes\n  - `content_type`: MIME type\n  - `filename`: Original filename\n  - `uploaded_at`: ISO timestamp of when file was uploaded\n- `files_count`: Number of files\n- `knowledge_base_saved`: Boolean indicating if knowledge base is saved\n\n**Note:** Download URLs are signed and expire after 60 minutes. Frontend should request new URLs if needed."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Single File Metadata",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/product-catalog.pdf\",\n    \"title\": \"Updated Product Catalog Title\",\n    \"usage_description\": \"Updated description of how agent should use this file...\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/knowledge-base/file",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"knowledge-base",
+								"file"
+							]
+						},
+						"description": "Update a single knowledge base file's metadata (title and/or usage_description).\n\n**Use Case:** Edit individual file metadata without affecting other files.\n\n**Fields:**\n- `merchant_id`: Merchant identifier\n- `user_id`: User identifier\n- `file_path`: GCS object path of the file to update (required)\n- `title`: New title (optional - only updates if provided)\n- `usage_description`: New usage description (optional - only updates if provided)\n\n**Response:**\n- `status`: \"updated\"\n- `file`: Updated file information\n- `message`: Success message\n\n**Note:** This only updates metadata in the database. The file in GCS is not modified."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Single File",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"file_path\": \"merchants/{{merchant_id}}/knowledge_base/product-catalog.pdf\",\n    \"delete_from_storage\": true\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/knowledge-base/file",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"knowledge-base",
+								"file"
+							]
+						},
+						"description": "Delete a single knowledge base file.\n\n**Use Case:** Remove a file from the knowledge base and optionally delete it from GCS storage.\n\n**What it does:**\n1. Removes the file from knowledge base metadata (database)\n2. Optionally deletes the file from GCS storage (if `delete_from_storage: true`)\n\n**Fields:**\n- `merchant_id`: Merchant identifier\n- `user_id`: User identifier\n- `file_path`: GCS object path of the file to delete (required)\n- `delete_from_storage`: Whether to delete from GCS (default: true)\n\n**Response:**\n- `status`: \"deleted\"\n- `file_path`: Path of deleted file\n- `deleted_from_storage`: Boolean indicating if file was deleted from GCS\n- `remaining_files_count`: Number of files remaining in knowledge base\n- `message`: Success message\n\n**Note:**\n- If `delete_from_storage: false`, the file remains in GCS but is removed from knowledge base metadata\n- Other files in the knowledge base are not affected"
+					},
+					"response": []
+				},
+				{
+					"name": "Step 3: Create Agent (Trigger Onboarding)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"Status code is 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"",
+									"pm.test(\"Agent creation started\", function () {",
+									"    var jsonData = pm.response.json();",
+									"    pm.expect(jsonData).to.have.property('merchant_id');",
+									"    pm.expect(jsonData.status).to.be.oneOf(['started', 'validation_failed']);",
+									"    if (jsonData.status === 'started') {",
+									"        pm.expect(jsonData).to.have.property('job_id');",
+									"    }",
+									"});"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/create",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"create"
+							]
+						},
+						"description": "**Step 3: Create Agent (Trigger Onboarding)**\n\nTriggers onboarding process with all collected data from Steps 1 & 2.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription in `billing.user_subscriptions` table\n- Returns `402 Payment Required` if no active subscription\n- Error: \"Active subscription required to create agents. Please upgrade your plan.\"\n\n**Prerequisites:**\n- Step 1 (AI Persona) must be completed\n- Step 2 (Knowledge Base) must be completed\n- Active subscription required\n\n**What it does:**\n1. Checks if user has active subscription\n2. Validates Steps 1 & 2 are completed\n3. Retrieves all saved data from database\n4. Validates required fields (shop_name, shop_url, bot_name)\n5. Triggers full onboarding process:\n   - Create folder structure\n   - Process products file\n   - Process categories file\n   - Convert documents\n   - Setup Vertex AI Search datastore\n   - Generate merchant config\n\n**Response (Success):**\n- `job_id`: Onboarding job ID\n- `merchant_id`: Merchant ID\n- `status`: \"started\"\n\n**Response (No Subscription):**\n- HTTP Status: `402 Payment Required`\n- `detail`: \"Active subscription required to create agents. Please upgrade your plan.\"\n\n**Response (Validation Failed):**\n- `status`: \"validation_failed\"\n- `missing_fields`: Array of missing required fields\n- `message`: Error message"
+					},
+					"response": []
+				},
+				{
+					"name": "List All Agents/Merchants",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/agents?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "List all active agents/merchants for a user.\n\nReturns merchants with `flow_status` indicating:\n- `ai_persona_saved`: Step 1 completed\n- `knowledge_base_saved`: Step 2 completed\n- `agent_created`: Step 3 completed (onboarding triggered)\n- `onboarding_completed`: Onboarding process finished\n\n**Status values:**\n- `draft`: AI Persona or Knowledge Base saved but agent not created\n- `active`: Agent created and onboarding completed\n- `onboarding`: Onboarding in progress\n- `error`: Onboarding failed"
+					},
+					"response": []
+				},
+				{
+					"name": "Get Agent/Merchant Details",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/merchants/{{merchant_id}}?user_id={{user_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"merchants",
+								"{{merchant_id}}"
+							],
+							"query": [
+								{
+									"key": "user_id",
+									"value": "{{user_id}}"
+								}
+							]
+						},
+						"description": "Get complete merchant/agent information with document download URLs.\n\n**Returns:**\n- AI Persona information (Step 1)\n- Knowledge Base information (Step 2)\n- **Documents array** with download URLs:\n  - `file_path`: GCS object path\n  - `title`: Title for this file\n  - `usage_description`: How agent should use this file\n  - `download_url`: Signed URL for downloading (expires in 60 minutes)\n  - `download_url_expires_in`: Seconds until URL expires\n  - `file_size`: File size in bytes\n  - `content_type`: MIME type\n  - `filename`: Original filename\n  - `uploaded_at`: ISO timestamp\n- `documents_count`: Number of documents\n- Onboarding status\n- Flow completion status\n\n**Frontend Usage:**\n- Display list of uploaded documents with titles\n- Show file sizes and upload dates\n- Provide download buttons using `download_url`\n- Handle URL expiration (request new URLs if needed)\n\n**Security:** Requires both `merchant_id` AND `user_id` to verify ownership."
+					},
+					"response": []
+				}
+			]
+		},
+		{
 			"name": "Complete Workflow Example",
 			"item": [
 				{
@@ -817,6 +1183,12 @@
 									"key": "merchant_id",
 									"value": "{{merchant_id}}",
 									"type": "text"
+								},
+								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
 								},
 								{
 									"key": "folder",
@@ -886,6 +1258,12 @@
 									"key": "merchant_id",
 									"value": "{{merchant_id}}",
 									"type": "text"
+								},
+								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
 								},
 								{
 									"key": "folder",
@@ -970,7 +1348,8 @@
 							"path": [
 								"onboard"
 							]
-						}
+						},
+						"description": "Start onboarding with multiple knowledge base files.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription in `billing.user_subscriptions` table\n- Returns `402 Payment Required` if no active subscription\n- Error: \"Active subscription required to start onboarding. Please upgrade your plan.\"\n\n**Note:** This is the legacy onboarding endpoint. For new agent creation flow, use `/agents/create` (Step 3) instead.\n\n**What it does:**\n1. Checks if user has active subscription\n2. Creates folder structure\n3. Processes products file (auto-detected from knowledge_base)\n4. Processes categories file (auto-detected from knowledge_base)\n5. Converts documents\n6. Sets up Vertex AI Search datastore (with website crawling if shop_url provided)\n7. Generates merchant config\n\nUpdate file_paths with all uploaded files."
 					},
 					"response": []
 				},
@@ -1028,6 +1407,12 @@
 									"type": "text"
 								},
 								{
+									"key": "user_id",
+									"value": "{{user_id}}",
+									"type": "text",
+									"description": "User identifier (required for security verification)"
+								},
+								{
 									"key": "files",
 									"value": "[{\"folder\":\"knowledge_base\",\"filename\":\"faq.pdf\",\"content_type\":\"application/pdf\"},{\"folder\":\"knowledge_base\",\"filename\":\"manual.docx\",\"content_type\":\"application/vnd.openxmlformats-officedocument.wordprocessingml.document\"},{\"folder\":\"prompt-docs\",\"filename\":\"products.csv\",\"content_type\":\"text/csv\"}]",
 									"type": "text"
@@ -1044,7 +1429,7 @@
 								"upload-urls"
 							]
 						},
-						"description": "Get multiple signed URLs at once for bulk file uploads. Update the files JSON array with your actual files."
+						"description": "Get multiple signed URLs at once for bulk file uploads.\n\n**Security:** Requires `user_id` to verify user owns `merchant_id`.\n\n**Note:** File uploads are allowed without subscription (for draft/saving purposes). Subscription is checked when creating the agent (Step 3).\n\nUpdate the files JSON array with your actual files."
 					},
 					"response": []
 				},
@@ -1102,7 +1487,7 @@
 								"onboard"
 							]
 						},
-						"description": "Start onboarding with multiple knowledge base files. Update file_paths with all uploaded files."
+						"description": "Start onboarding with multiple knowledge base files.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription in `billing.user_subscriptions` table\n- Returns `402 Payment Required` if no active subscription\n- Error: \"Active subscription required to start onboarding. Please upgrade your plan.\"\n\n**Note:** This is the legacy onboarding endpoint. For new agent creation flow, use `/agents/create` (Step 3) instead.\n\n**What it does:**\n1. Checks if user has active subscription\n2. Creates folder structure\n3. Processes products file (auto-detected from knowledge_base)\n4. Processes categories file (auto-detected from knowledge_base)\n5. Converts documents\n6. Sets up Vertex AI Search datastore (with website crawling if shop_url provided)\n7. Generates merchant config\n\nUpdate file_paths with all uploaded files."
 					},
 					"response": []
 				},
