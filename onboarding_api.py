@@ -1987,12 +1987,17 @@ async def list_merchants(user_id: str, status: Optional[str] = None):
         # Transform each merchant to match creation format (frontend field names)
         transformed_merchants = []
         for merchant in merchants:
+            # Check if merchant is connected to Shopify
+            merchant_id = merchant.get('merchant_id')
+            is_connected = get_crm_integrations(merchant_id)
+
             # Add flow status
             flow_status = {
                 'ai_persona_saved': merchant.get('ai_persona_saved', False),
                 'knowledge_base_saved': merchant.get('knowledge_base_saved', False),
                 'agent_created': merchant.get('agent_created', False),
-                'onboarding_completed': merchant.get('step_onboarding_completed', False)
+                'onboarding_completed': merchant.get('step_onboarding_completed', False),
+                'is_connected': is_connected
             }
             
             # Transform to frontend field names
