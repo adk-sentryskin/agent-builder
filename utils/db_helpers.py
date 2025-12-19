@@ -307,39 +307,41 @@ def update_merchant_onboarding_step(
 # CRM INTEGRATION FUNCTIONS
 # ============================================================================
 
-def get_crm_integrations(user_id: str) -> list:
+def get_crm_integrations(merchant_id: str) -> bool:
     """
-    Get all CRM integrations for a user
+    Check if merchant is connected to Shopify by verifying access token exists
 
     Args:
-        user_id: User identifier
+        merchant_id: Merchant identifier
 
     Returns:
-        List of CRM types (e.g., ['hubspot', 'salesforce'])
+        True if merchant has valid Shopify access token, False otherwise
     """
     conn = None
     try:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Query crm_integration table in crm schema
+        # Query merchants table in shopify_sync schema to check if access token exists
         query = """
-            SELECT crm_type
-            FROM crm.crm_integration
-            WHERE user_id = %s
+            SELECT access_token
+            FROM shopify_sync.merchants
+            WHERE merchant_id = %s
         """
 
-        cursor.execute(query, (user_id,))
-        results = cursor.fetchall()
+        cursor.execute(query, (merchant_id,))
+        result = cursor.fetchone()
         cursor.close()
 
-        # Extract crm_type values into an array
-        crm_types = [row['crm_type'] for row in results] if results else []
-        return crm_types
+        # Check if merchant exists and has access_token
+        if result and result.get('access_token'):
+            return True
+        else:
+            return False
 
     except Exception as e:
-        logger.error(f"Error getting CRM integrations: {e}")
-        return []
+        logger.error(f"Error checking Shopify connection: {e}")
+        return False
     finally:
         if conn:
             return_connection(conn)

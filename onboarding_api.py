@@ -1797,15 +1797,15 @@ async def get_merchant_info(merchant_id: str, user_id: str):
             )
         
         # Add flow status
-        # Get CRM integrations for the user
-        connected_to = get_crm_integrations(user_id)
+        # Check if merchant is connected to Shopify
+        is_connected = get_crm_integrations(merchant_id)
 
         merchant['flow_status'] = {
             'ai_persona_saved': merchant.get('ai_persona_saved', False),
             'knowledge_base_saved': merchant.get('knowledge_base_saved', False),
             'agent_created': merchant.get('agent_created', False),
             'onboarding_completed': merchant.get('step_onboarding_completed', False),
-            'connected_to': connected_to
+            'is_connected': is_connected
         }
         
         # Get knowledge base files with download URLs
