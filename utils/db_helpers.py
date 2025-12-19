@@ -304,6 +304,48 @@ def update_merchant_onboarding_step(
 
 
 # ============================================================================
+# CRM INTEGRATION FUNCTIONS
+# ============================================================================
+
+def get_crm_integrations(user_id: str) -> list:
+    """
+    Get all CRM integrations for a user
+
+    Args:
+        user_id: User identifier
+
+    Returns:
+        List of CRM types (e.g., ['hubspot', 'salesforce'])
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Query crm_integration table in crm schema
+        query = """
+            SELECT crm_type
+            FROM crm.crm_integration
+            WHERE user_id = %s
+        """
+
+        cursor.execute(query, (user_id,))
+        results = cursor.fetchall()
+        cursor.close()
+
+        # Extract crm_type values into an array
+        crm_types = [row['crm_type'] for row in results] if results else []
+        return crm_types
+
+    except Exception as e:
+        logger.error(f"Error getting CRM integrations: {e}")
+        return []
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+# ============================================================================
 # SUBSCRIPTION FUNCTIONS
 # ============================================================================
 

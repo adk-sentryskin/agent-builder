@@ -24,9 +24,9 @@ from handlers.vertex_setup import VertexSetup
 from handlers.config_generator import ConfigGenerator
 from utils.status_tracker import StatusTracker, StepStatus
 from utils.db_helpers import (
-    get_merchant, create_merchant, update_merchant, delete_merchant, 
+    get_merchant, create_merchant, update_merchant, delete_merchant,
     get_user_merchants, verify_merchant_access, update_merchant_onboarding_step,
-    check_subscription, get_connection, return_connection
+    check_subscription, get_connection, return_connection, get_crm_integrations
 )
 
 # Configure logging (console only - production logs go to Cloud Logging/stdout)
@@ -1797,11 +1797,15 @@ async def get_merchant_info(merchant_id: str, user_id: str):
             )
         
         # Add flow status
+        # Get CRM integrations for the user
+        connected_to = get_crm_integrations(user_id)
+
         merchant['flow_status'] = {
             'ai_persona_saved': merchant.get('ai_persona_saved', False),
             'knowledge_base_saved': merchant.get('knowledge_base_saved', False),
             'agent_created': merchant.get('agent_created', False),
-            'onboarding_completed': merchant.get('step_onboarding_completed', False)
+            'onboarding_completed': merchant.get('step_onboarding_completed', False),
+            'connected_to': connected_to
         }
         
         # Get knowledge base files with download URLs
