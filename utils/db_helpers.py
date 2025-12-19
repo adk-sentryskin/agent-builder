@@ -578,10 +578,10 @@ def verify_merchant_access(merchant_id: str, user_id: str) -> bool:
 def get_user_merchants(user_id: str) -> list:
     """
     Get all merchants for a user
-    
+
     Args:
         user_id: User identifier
-    
+
     Returns:
         List of merchant dicts
     """
@@ -589,21 +589,65 @@ def get_user_merchants(user_id: str) -> list:
     try:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
+
         query = """
             SELECT * FROM merchants
             WHERE user_id = %s
-            ORDER BY created_at DESC
+            ORDER BY updated_at DESC
         """
-        
+
         cursor.execute(query, (user_id,))
         results = cursor.fetchall()
         cursor.close()
-        
+
         return [dict(row) for row in results]
-        
+
     except Exception as e:
         logger.error(f"Error getting user merchants: {e}")
+        return []
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_user_merchants_with_connection_status(user_id: str) -> list:
+    """
+    Get all merchants for a user with their Shopify connection status
+    Uses a single JOIN query for better performance
+
+    Args:
+        user_id: User identifier
+
+    Returns:
+        List of merchant dicts with is_connected field added
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        query = """
+            SELECT
+                m.*,
+                CASE
+                    WHEN sm.access_token IS NOT NULL AND sm.access_token != ''
+                    THEN true
+                    ELSE false
+                END as is_connected
+            FROM merchants m
+            LEFT JOIN shopify_sync.merchants sm ON m.merchant_id = sm.merchant_id
+            WHERE m.user_id = %s
+            ORDER BY m.updated_at DESC
+        """
+
+        cursor.execute(query, (user_id,))
+        results = cursor.fetchall()
+        cursor.close()
+
+        return [dict(row) for row in results]
+
+    except Exception as e:
+        logger.error(f"Error getting user merchants with connection status: {e}")
         return []
     finally:
         if conn:

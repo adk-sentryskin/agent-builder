@@ -25,7 +25,8 @@ from handlers.config_generator import ConfigGenerator
 from utils.status_tracker import StatusTracker, StepStatus
 from utils.db_helpers import (
     get_merchant, create_merchant, update_merchant, delete_merchant,
-    get_user_merchants, verify_merchant_access, update_merchant_onboarding_step,
+    get_user_merchants, get_user_merchants_with_connection_status,
+    verify_merchant_access, update_merchant_onboarding_step,
     check_subscription, get_connection, return_connection, get_crm_integrations
 )
 
@@ -1978,18 +1979,18 @@ async def list_merchants(user_id: str, status: Optional[str] = None):
         status: Optional filter by status (active, draft, onboarding, error)
     """
     try:
-        merchants = get_user_merchants(user_id)
-        
+        # Use optimized function that gets connection status in a single query
+        merchants = get_user_merchants_with_connection_status(user_id)
+
         # Filter by status if provided
         if status:
             merchants = [m for m in merchants if m.get('status') == status or m.get('onboarding_status') == status]
-        
+
         # Transform each merchant to match creation format (frontend field names)
         transformed_merchants = []
         for merchant in merchants:
-            # Check if merchant is connected to Shopify
-            merchant_id = merchant.get('merchant_id')
-            is_connected = get_crm_integrations(merchant_id)
+            # Get is_connected from the merchant data (already fetched via JOIN)
+            is_connected = merchant.get('is_connected', False)
 
             # Add flow status
             flow_status = {
