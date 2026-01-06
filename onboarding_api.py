@@ -149,6 +149,7 @@ class SaveAIPersonaRequest(BaseModel):
     top_products: Optional[List[str]] = Field(None, description="Top-3 product links to sell/promote")
     customer_persona: Optional[str] = Field(None, description="Describe your ideal customer persona")
     system_prompt: Optional[str] = Field(None, description="System Prompt for AI Assistant")
+    is_connected: bool = Field(False, description="Whether the integration is connected")
     
     def get_merchant_id(self) -> str:
         """Generate merchant_id from store_name if not provided"""
@@ -1065,21 +1066,25 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
         
         # Mark AI Persona as saved
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
-                (merchant_id, request.user_id)
-            )
-            conn.commit()
-            cursor.close()
-        except Exception as e:
-            logger.error(f"Error updating ai_persona_saved flag: {e}")
-        finally:
-            if conn:
-                return_connection(conn)
+        # Mark AI Persona as saved - ONLY if is_connected is True
+        if request.is_connected:
+            conn = None
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
+                    (merchant_id, request.user_id)
+                )
+                conn.commit()
+                cursor.close()
+            except Exception as e:
+                logger.error(f"Error updating ai_persona_saved flag: {e}")
+            finally:
+                if conn:
+                    return_connection(conn)
+        else:
+            logger.info(f"Skipping ai_persona_saved update for merchant {merchant_id} (is_connected=False)")
         
         # Create folder structure immediately after saving AI Persona
         # This ensures folders exist before file uploads in Step 2
