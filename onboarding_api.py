@@ -1066,8 +1066,9 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
         
         # Mark AI Persona as saved
-        # Mark AI Persona as saved - ONLY if is_connected is True
-        if request.is_connected:
+        # Check if merchant is connected via get_crm_integrations
+        is_connected = get_crm_integrations(merchant_id)
+        if is_connected:
             conn = None
             try:
                 conn = get_connection()
@@ -1084,7 +1085,7 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
                 if conn:
                     return_connection(conn)
         else:
-            logger.info(f"Skipping ai_persona_saved update for merchant {merchant_id} (is_connected=False)")
+            logger.info(f"Skipping ai_persona_saved update for merchant {merchant_id} (CRM integration not connected)")
         
         # Create folder structure immediately after saving AI Persona
         # This ensures folders exist before file uploads in Step 2
