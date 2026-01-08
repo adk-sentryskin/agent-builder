@@ -738,7 +738,7 @@
 								}
 							]
 						},
-						"description": "Get merchant_config.json content including custom_chatbot fields"
+						"description": "Get merchant_config.json content including custom_chatbot fields.\n\n**Returns:**\n- Full merchant configuration JSON\n- **Custom Chatbot fields** with:\n  - `title`: Chatbot title\n  - `tag_line`: Chatbot tag line\n  - `font_family`: Font family\n  - `color`: Primary color (hex code)\n  - `logo_signed_url`: **Signed URL for logo** (expires in 60 minutes)\n  - `logo_url_expires_in`: Seconds until logo URL expires\n  - `position`: Chatbot position\n- **Branding fields** with:\n  - `logo_signed_url`: **Signed URL for branding logo** (expires in 60 minutes)\n  - `logo_url_expires_in`: Seconds until logo URL expires\n  - `primary_color`: Primary color\n  - `secondary_color`: Secondary color\n\n**⚠️ IMPORTANT: Logo Signed URLs**\n- Logo URLs are **automatically generated** as signed URLs with 60-minute expiration\n- Signed URLs are generated on-the-fly when retrieving config (not stored in config file)\n- Original public URLs are stored in config, but signed URLs are returned for security\n- If signed URL generation fails, original public URL is returned\n- **Frontend should:** Cache signed URLs and request new config if they expire\n\n**Security:**\n- Only generates signed URLs for logos belonging to the requesting merchant\n- Validates merchant ownership before generating signed URLs\n- Returns 404 if merchant not found or access denied"
 					},
 					"response": []
 				},
@@ -1097,6 +1097,145 @@
 							]
 						},
 						"description": "**Step 3: Create Agent (Trigger Onboarding)**\n\nTriggers onboarding process with all collected data from Steps 1 & 2.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription in `billing.user_subscriptions` table\n- Returns `402 Payment Required` if no active subscription\n- Error: \"Active subscription required to create agents. Please upgrade your plan.\"\n- **Exception:** Production users (user_type = 'production') bypass subscription checks\n\n**Prerequisites:**\n- Step 1 (AI Persona) must be completed\n- Step 2 (Knowledge Base) must be completed\n- Active subscription required (or production user)\n\n**What it does:**\n1. Checks if user has active subscription\n2. Validates Steps 1 & 2 are completed\n3. Retrieves all saved data from database\n4. Validates required fields (shop_name, shop_url, bot_name)\n5. Triggers full onboarding process:\n   - Create folder structure\n   - Process products file\n   - Process categories file\n   - Convert documents\n   - Setup Vertex AI Search datastore\n   - Generate merchant config\n\n**Response (Success):**\n- `job_id`: Onboarding job ID\n- `merchant_id`: Merchant ID\n- `status`: \"started\"\n\n**Response (No Subscription):**\n- HTTP Status: `402 Payment Required`\n- `detail`: \"Active subscription required to create agents. Please upgrade your plan.\"\n\n**Response (Validation Failed):**\n- `status`: \"validation_failed\"\n- `missing_fields`: Array of missing required fields\n- `message`: Error message"
+					},
+					"response": []
+				},
+				{
+					"name": "Step 4: Save Custom Chatbot Configuration",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"Status code is 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"",
+									"pm.test(\"Custom Chatbot saved\", function () {",
+									"    var jsonData = pm.response.json();",
+									"    pm.expect(jsonData).to.have.property('merchant_id');",
+									"    pm.expect(jsonData).to.have.property('custom_chatbot_saved', true);",
+									"    pm.expect(jsonData).to.have.property('custom_chatbot');",
+									"});"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"title\": \"Help Assistant\",\n    \"tag_line\": \"How can I help you today?\",\n    \"font_family\": \"Roboto, sans-serif\",\n    \"color\": \"#667eea\",\n    \"logo_path\": \"merchants/{{merchant_id}}/brand-images/logo.png\",\n    \"position\": \"bottom-right\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/custom-chatbot",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"custom-chatbot"
+							]
+						},
+						"description": "**Step 4: Save Custom Chatbot Configuration**\n\nThis endpoint saves custom chatbot UI settings like title, tagline, font, color, logo, and position.\n\n**⚠️ IMPORTANT:** This should be called AFTER agent creation (Step 3).\n\n**Prerequisites:**\n- Step 3 (Create Agent) must be completed first\n- Agent must exist (`agent_created = TRUE`)\n\n**What it does:**\n1. Validates merchant exists and user has access\n2. Validates agent is created (Step 3 must be completed first)\n3. Updates `merchant_config.json` in GCS with `custom_chatbot` settings\n4. Updates database with `logo_url` (if `logo_path` provided)\n5. Preserves all other existing config fields\n\n**Logo Upload Process:**\n1. First, upload logo via `POST /files/upload-url` (folder: \"brand-images\")\n2. Upload the file directly to GCS using the signed URL\n3. Use the `object_path` from upload response as `logo_path` in this request\n4. The system will convert `logo_path` to a public GCS URL and store it\n\n**Fields:**\n- `merchant_id`: Merchant identifier (required)\n- `user_id`: User identifier (required)\n- `title`: Chatbot title (optional, max 100 chars, e.g., \"AI Assistant\")\n- `tag_line`: Chatbot tag line (optional, max 200 chars)\n- `font_family`: Font family (optional, max 100 chars, e.g., \"Inter, sans-serif\")\n- `color`: Primary color (optional, hex code, e.g., \"#667eea\")\n- `logo_path`: Logo GCS object path (optional, e.g., `merchants/{merchant_id}/brand-images/logo.png`)\n- `position`: Chatbot position (optional: \"bottom-right\", \"bottom-left\", \"top-right\", \"top-left\")\n\n**Validation:**\n- Color must be valid hex code (e.g., #667eea or 667eea)\n- Position must be one of: bottom-right, bottom-left, top-right, top-left\n- Logo path must start with `merchants/{merchant_id}/` and be in `brand-images` folder\n- Logo must have valid image extension (.png, .jpg, .jpeg, .svg, .gif, .webp)\n\n**Response:**\n- `merchant_id`: Merchant identifier\n- `status`: \"saved\"\n- `custom_chatbot_saved`: true\n- `config_path`: Path to updated config file\n- `custom_chatbot`: Updated custom_chatbot configuration\n- `message`: Success message\n\n**Note:** At least one field must be provided to update."
+					},
+					"response": []
+				},
+				{
+					"name": "Step 4: Update Custom Chatbot Configuration",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"title\": \"Updated Help Assistant\",\n    \"tag_line\": \"Updated tag line\",\n    \"color\": \"#ff0000\",\n    \"position\": \"bottom-left\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/custom-chatbot",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"custom-chatbot"
+							]
+						},
+						"description": "**Step 4: Update Custom Chatbot Configuration (Edit Mode)**\n\nThis is an alias for POST /agents/custom-chatbot.\n\nUpdates existing custom chatbot configuration.\n\nSame validation and behavior as POST endpoint."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Agent - Re-process Knowledge Base",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test(\"Status code is 200\", function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"",
+									"pm.test(\"Agent update started\", function () {",
+									"    var jsonData = pm.response.json();",
+									"    pm.expect(jsonData).to.have.property('merchant_id');",
+									"    pm.expect(jsonData).to.have.property('status', 'update_started');",
+									"    pm.expect(jsonData).to.have.property('status_url');",
+									"});"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"merchant_id\": \"{{merchant_id}}\",\n    \"user_id\": \"{{user_id}}\",\n    \"update_products\": false,\n    \"update_categories\": false\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/agents/update",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"agents",
+								"update"
+							]
+						},
+						"description": "**Update Agent - Re-process Knowledge Base After Changes**\n\nThis endpoint is used when knowledge base files are added, updated, or deleted.\nIt re-processes only the necessary parts without full onboarding.\n\n**⚠️ SUBSCRIPTION REQUIRED:**\n- User must have an active subscription\n- Returns `402 Payment Required` if no active subscription\n- **Exception:** Production users bypass subscription checks\n\n**Prerequisites:**\n- Agent must exist (`agent_created = TRUE`)\n- Knowledge Base must be saved (`knowledge_base_saved = TRUE`)\n\n**What this endpoint does:**\n1. ✅ Validates that agent exists (agent_created = TRUE)\n2. ✅ Validates that knowledge base is saved\n3. ✅ Re-converts documents from knowledge_base folder\n4. ✅ Re-imports documents to Vertex AI (INCREMENTAL mode - adds/updates only)\n5. ✅ Optionally re-processes products/categories if requested\n\n**What this endpoint does NOT do:**\n- ❌ Re-create datastores (they already exist)\n- ❌ Re-process website crawling\n- ❌ Re-generate config (uses existing)\n- ❌ Re-create merchant record\n\n**Fields:**\n- `merchant_id`: Merchant identifier (required)\n- `user_id`: User identifier (required)\n- `update_products`: Whether to re-process products file (optional, default: false)\n- `update_categories`: Whether to re-process categories file (optional, default: false)\n\n**Process:**\n- **Documents**: Always re-processed (re-converted and re-imported to Vertex AI)\n- **Products**: Re-processed only if `update_products=true` and products file exists\n- **Categories**: Re-processed only if `update_categories=true` and categories file exists\n\n**Response:**\n- `job_id`: Update job ID\n- `merchant_id`: Merchant identifier\n- `status`: \"update_started\"\n- `status_url`: URL to poll for update status (`/onboard-status/{merchant_id}`)\n- `message`: Description of update process\n\n**Monitor Progress:**\nUse `GET /onboard-status/{merchant_id}` to monitor the update progress.\n\nThis is a lightweight update compared to full onboarding."
 					},
 					"response": []
 				},
