@@ -66,6 +66,20 @@ class ConfigGenerator:
             # Get current timestamp in ISO format
             now = datetime.now(timezone.utc).isoformat()
             
+            # Try to read existing config to preserve custom_chatbot settings
+            existing_config = {}
+            config_path = f"merchants/{merchant_id}/merchant_config.json"
+            try:
+                if self.gcs_handler.file_exists(config_path):
+                    file_content = self.gcs_handler.download_file(config_path)
+                    existing_config = json.loads(file_content.decode('utf-8'))
+                    logger.info(f"Loaded existing config to preserve custom_chatbot settings")
+            except Exception as e:
+                logger.debug(f"Could not read existing config (will create new): {e}")
+            
+            # Preserve existing custom_chatbot settings if they exist
+            existing_custom_chatbot = existing_config.get("custom_chatbot", {})
+            
             # Construct logo URL if provided (convert GCS path to full URL if needed)
             full_logo_url = logo_url
             if logo_url and not logo_url.startswith(('http://', 'https://')):
@@ -79,6 +93,10 @@ class ConfigGenerator:
                 else:
                     # Assume it's a GCS path relative to bucket
                     full_logo_url = f"https://storage.cloud.google.com/{self.gcs_handler.bucket_name}/{logo_url}"
+            
+            # Use existing logo from custom_chatbot if no new logo provided
+            if not full_logo_url and existing_custom_chatbot.get("logo_signed_url"):
+                full_logo_url = existing_custom_chatbot.get("logo_signed_url")
             
             # Build the complete config structure
             config = {
@@ -107,17 +125,19 @@ class ConfigGenerator:
                     "logo_url": full_logo_url or ""
                 },
                 "custom_chatbot": {
-                    "title": bot_name or "AI Assistant",
-                    "logo_signed_url": full_logo_url or "",
-                    "color": primary_color or "#667eea",
-                    "font_family": "Inter, sans-serif",
-                    "tag_line": "",
-                    "position": "bottom-right"
+                    # Preserve existing custom_chatbot settings if they exist, otherwise use defaults
+                    "title": existing_custom_chatbot.get("title", bot_name or "AI Assistant"),
+                    "logo_signed_url": existing_custom_chatbot.get("logo_signed_url", full_logo_url or ""),
+                    "color": existing_custom_chatbot.get("color", primary_color or "#667eea"),
+                    "font_family": existing_custom_chatbot.get("font_family", "Inter, sans-serif"),
+                    "tag_line": existing_custom_chatbot.get("tag_line", ""),
+                    "position": existing_custom_chatbot.get("position", "bottom-right")
                 },
                 "metadata": {
-                    "created_at": now,
+                    # Preserve created_at from existing config if it exists
+                    "created_at": existing_config.get("metadata", {}).get("created_at", now),
                     "updated_at": now,
-                    "version": "1.0"
+                    "version": existing_config.get("metadata", {}).get("version", "1.0")
                 }
             }
 

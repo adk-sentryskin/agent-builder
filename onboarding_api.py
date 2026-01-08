@@ -3,7 +3,7 @@
 import os
 import json
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -16,7 +16,7 @@ except ImportError:
 
 from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from handlers.gcs_handler import GCSHandler
 from handlers.product_processor import ProductProcessor
@@ -107,6 +107,134 @@ def _string_to_array(value: Optional[str]) -> List[str]:
     return [item.strip() for item in value.split('\n') if item.strip()]
 
 
+# Validation helper functions
+def validate_color(color: str) -> bool:
+    """
+    Validate hex color code format
+    
+    Args:
+        color: Color string (e.g., "#667eea" or "667eea")
+    
+    Returns:
+        True if valid hex color, False otherwise
+    """
+    if not color:
+        return False
+    # Remove # if present
+    color = color.lstrip('#')
+    # Check if it's a valid hex color (3 or 6 characters)
+    if len(color) not in [3, 6]:
+        return False
+    # Check if all characters are valid hex digits
+    try:
+        int(color, 16)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_position(position: str) -> bool:
+    """
+    Validate chatbot position value
+    
+    Args:
+        position: Position string
+    
+    Returns:
+        True if valid position, False otherwise
+    """
+    valid_positions = ['bottom-right', 'bottom-left', 'top-right', 'top-left']
+    return position.lower() in valid_positions if position else False
+
+
+def validate_logo_path(logo_path: str) -> Tuple[bool, Optional[str]]:
+    """
+    Validate logo path format
+    
+    Args:
+        logo_path: Logo GCS object path
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not logo_path:
+        return True, None  # Empty is valid (optional)
+    
+    # Check if it's a GCS path format
+    # Expected: merchants/{merchant_id}/brand-images/logo.png
+    if logo_path.startswith('gs://'):
+        # Extract path from gs:// URL
+        parts = logo_path.replace('gs://', '').split('/', 1)
+        if len(parts) != 2:
+            return False, "Invalid gs:// URL format. Expected: gs://bucket/path"
+        logo_path = parts[1]
+    
+    # Check if it starts with merchants/
+    if not logo_path.startswith('merchants/'):
+        return False, "Logo path must start with 'merchants/'"
+    
+    # Check if it contains brand-images folder
+    if 'brand-images' not in logo_path:
+        return False, "Logo must be in 'brand-images' folder"
+    
+    # Check if it has a valid extension
+    valid_extensions = ['.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp']
+    if not any(logo_path.lower().endswith(ext) for ext in valid_extensions):
+        return False, f"Logo must have a valid image extension: {', '.join(valid_extensions)}"
+    
+    return True, None
+
+
+def _extract_gcs_path_from_url(url: str, merchant_id: str) -> Optional[str]:
+    """
+    Extract GCS object path from a public GCS URL and validate it belongs to merchant
+    
+    Args:
+        url: Public GCS URL (e.g., https://storage.cloud.google.com/bucket/path/to/file.png)
+             or gs:// URL (e.g., gs://bucket/path/to/file.png)
+             or GCS path (e.g., merchants/my-store/brand-images/logo.png)
+        merchant_id: Merchant identifier for validation
+    
+    Returns:
+        GCS object path (e.g., merchants/my-store/brand-images/logo.png) or None if invalid
+    """
+    if not url:
+        return None
+    
+    path = None
+    
+    # If it's already a GCS path (doesn't start with http/https/gs://)
+    if not url.startswith(('http://', 'https://', 'gs://')):
+        path = url
+    # If it's a gs:// URL, extract the path
+    elif url.startswith('gs://'):
+        parts = url.replace('gs://', '').split('/', 1)
+        if len(parts) == 2:
+            path = parts[1]  # Return just the path
+    # If it's a public GCS URL, extract the path
+    elif 'storage.cloud.google.com' in url or 'storage.googleapis.com' in url:
+        # Remove protocol and domain
+        full_path = url.split('storage.cloud.google.com/')[-1] if 'storage.cloud.google.com' in url else url.split('storage.googleapis.com/')[-1]
+        # Remove bucket name (first part)
+        parts = full_path.split('/', 1)
+        if len(parts) == 2:
+            path = parts[1]  # Return just the path after bucket
+    
+    # Security: Validate that path belongs to this merchant
+    if path:
+        expected_prefix = f"merchants/{merchant_id}/"
+        if not path.startswith(expected_prefix):
+            logger.warning(f"Security: Path {path} does not belong to merchant {merchant_id}")
+            return None
+        # Additional security: Prevent path traversal (e.g., ../)
+        if '..' in path or path.startswith('/'):
+            logger.warning(f"Security: Path {path} contains invalid characters")
+            return None
+        return path
+    
+    return None
+
+
 def generate_merchant_id(shop_name: str) -> str:
     """
     Generate merchant_id from shop_name
@@ -181,6 +309,41 @@ class UpdateAgentRequest(BaseModel):
     user_id: str
     update_products: bool = Field(False, description="Re-process products file if it exists")
     update_categories: bool = Field(False, description="Re-process categories file if it exists")
+
+
+class SaveCustomChatbotRequest(BaseModel):
+    """Save Custom Chatbot Configuration - Chatbot UI customization (Step 4)"""
+    merchant_id: str = Field(..., description="Merchant identifier")
+    user_id: str = Field(..., description="User identifier")
+    title: Optional[str] = Field(None, description="Chatbot title (e.g., AI Assistant)", max_length=100)
+    tag_line: Optional[str] = Field(None, description="Chatbot tag line", max_length=200)
+    font_family: Optional[str] = Field(None, description="Font family (e.g., Inter, sans-serif)", max_length=100)
+    color: Optional[str] = Field(None, description="Primary color (hex code, e.g., #667eea)", max_length=20)
+    logo_path: Optional[str] = Field(None, description="Logo GCS object path (e.g., merchants/{merchant_id}/brand-images/logo.png). Upload via /files/upload-url first.", max_length=500)
+    position: Optional[str] = Field(None, description="Chatbot position (bottom-right, bottom-left, top-right, top-left)", max_length=20)
+    
+    @field_validator('color')
+    @classmethod
+    def validate_color_format(cls, v: Optional[str]) -> Optional[str]:
+        if v and not validate_color(v):
+            raise ValueError('Invalid color format. Must be a valid hex color code (e.g., #667eea)')
+        return v
+    
+    @field_validator('position')
+    @classmethod
+    def validate_position_value(cls, v: Optional[str]) -> Optional[str]:
+        if v and not validate_position(v):
+            raise ValueError('Invalid position. Must be one of: bottom-right, bottom-left, top-right, top-left')
+        return v
+    
+    @field_validator('logo_path')
+    @classmethod
+    def validate_logo_path_format(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            is_valid, error_msg = validate_logo_path(v)
+            if not is_valid:
+                raise ValueError(error_msg or 'Invalid logo path format')
+        return v
 
 
 class OnboardRequest(BaseModel):
@@ -1041,6 +1204,8 @@ async def root():
             "delete_knowledge_base_file": "DELETE /agents/knowledge-base/file",
             "create_agent": "/agents/create",
             "update_agent": "/agents/update",
+            "save_custom_chatbot": "/agents/custom-chatbot",
+            "update_custom_chatbot": "/agents/custom-chatbot (PUT)",
             "list_agents": "/agents",
             "onboard": "/onboard",
             "status": "/onboard-status/{merchant_id}",
@@ -1765,6 +1930,221 @@ async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
     except Exception as e:
         logger.error(f"Error deleting knowledge base file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agents/custom-chatbot")
+async def save_custom_chatbot(request: SaveCustomChatbotRequest):
+    """
+    Save Custom Chatbot Configuration (Step 4) - Chatbot UI customization
+    
+    This endpoint saves custom chatbot UI settings like title, tagline, font, color, logo, and position.
+    This should be called AFTER agent creation (Step 3).
+    
+    What it does:
+    1. Validates merchant exists and user has access
+    2. Validates agent is created (Step 3 must be completed first)
+    3. Updates merchant_config.json in GCS with custom_chatbot settings
+    4. Updates database with logo_url (if logo_path provided)
+    5. Preserves all other existing config fields
+    
+    Logo Upload Process:
+    1. First, upload logo via POST /files/upload-url (folder: "brand-images")
+    2. Upload the file directly to GCS using the signed URL
+    3. Use the object_path from upload response as logo_path in this request
+    4. The system will convert logo_path to a public GCS URL and store it
+    
+    Example:
+    ```json
+    {
+      "merchant_id": "my-store",
+      "user_id": "firebase-user-123",
+      "title": "Help Assistant",
+      "tag_line": "How can I help you?",
+      "font_family": "Roboto, sans-serif",
+      "color": "#667eea",
+      "logo_path": "merchants/my-store/brand-images/logo.png",
+      "position": "bottom-right"
+    }
+    ```
+    
+    Returns:
+    - merchant_id
+    - status: "saved" or "updated"
+    - custom_chatbot_saved: true
+    - config: Updated merchant_config.json content
+    """
+    try:
+        # Verify merchant access
+        if not verify_merchant_access(request.merchant_id, request.user_id):
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Get merchant from database
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        # Validate agent is created (Step 3 must be completed first)
+        if not merchant.get('agent_created'):
+            raise HTTPException(
+                status_code=400,
+                detail="Agent not created yet. Please create agent first using POST /agents/create (Step 3)"
+            )
+        
+        # Prepare custom_chatbot config updates
+        custom_chatbot_updates = {}
+        
+        if request.title is not None:
+            custom_chatbot_updates["title"] = request.title
+        
+        if request.tag_line is not None:
+            custom_chatbot_updates["tag_line"] = request.tag_line
+        
+        if request.font_family is not None:
+            custom_chatbot_updates["font_family"] = request.font_family
+        
+        if request.color is not None:
+            # Ensure color has # prefix
+            color = request.color.lstrip('#')
+            custom_chatbot_updates["color"] = f"#{color}"
+        
+        if request.position is not None:
+            custom_chatbot_updates["position"] = request.position.lower()
+        
+        # Handle logo_path - convert to public URL and update both config and database
+        # Security: Validate logo_path belongs to this merchant
+        logo_url = None
+        if request.logo_path:
+            # Security: Validate logo_path belongs to this merchant
+            expected_prefix = f"merchants/{request.merchant_id}/"
+            
+            # Extract actual path for validation
+            actual_path = request.logo_path
+            if request.logo_path.startswith('gs://'):
+                # Extract path from gs:// URL
+                parts = request.logo_path.replace('gs://', '').split('/', 1)
+                if len(parts) == 2:
+                    actual_path = parts[1]
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid gs:// URL format")
+            elif request.logo_path.startswith(('http://', 'https://')):
+                # For external URLs, validate they're GCS URLs and extract path
+                if 'storage.cloud.google.com' in request.logo_path or 'storage.googleapis.com' in request.logo_path:
+                    full_path = request.logo_path.split('storage.cloud.google.com/')[-1] if 'storage.cloud.google.com' in request.logo_path else request.logo_path.split('storage.googleapis.com/')[-1]
+                    path_parts = full_path.split('/', 1)
+                    if len(path_parts) == 2:
+                        actual_path = path_parts[1]
+                else:
+                    # External URL (not GCS) - allow but log for security monitoring
+                    logger.info(f"External logo URL provided for merchant {request.merchant_id}: {request.logo_path[:50]}...")
+                    logo_url = request.logo_path
+                    custom_chatbot_updates["logo_signed_url"] = logo_url
+            
+            # Security: Validate path belongs to merchant (skip if external URL already set)
+            if logo_url is None:
+                if not actual_path.startswith(expected_prefix):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Logo path must belong to merchant {request.merchant_id}. Path must start with '{expected_prefix}'"
+                    )
+                # Additional security: Prevent path traversal
+                if '..' in actual_path or actual_path.startswith('/'):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid logo path: path traversal and absolute paths are not allowed"
+                    )
+                
+                # Convert validated path to public GCS URL
+                if request.logo_path.startswith('gs://'):
+                    parts = request.logo_path.replace('gs://', '').split('/', 1)
+                    if len(parts) == 2:
+                        bucket, path = parts
+                        logo_url = f"https://storage.cloud.google.com/{bucket}/{path}"
+                elif request.logo_path.startswith(('http://', 'https://')):
+                    # Already validated above, use as-is
+                    logo_url = request.logo_path
+                else:
+                    # GCS path relative to bucket (already validated)
+                    logo_url = f"https://storage.cloud.google.com/{gcs_handler.bucket_name}/{request.logo_path}"
+                
+                custom_chatbot_updates["logo_signed_url"] = logo_url
+        
+        # Only update if there are changes
+        if not custom_chatbot_updates:
+            raise HTTPException(
+                status_code=400,
+                detail="No fields provided to update. Please provide at least one custom_chatbot field."
+            )
+        
+        # Update merchant_config.json using config_generator
+        config_update_result = config_generator.update_config(
+            merchant_id=request.merchant_id,
+            new_fields={"custom_chatbot": custom_chatbot_updates},
+            preserve_existing=True
+        )
+        
+        # Update database with logo_url if provided
+        if logo_url:
+            conn = None
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    """UPDATE merchants 
+                       SET logo_url = %s,
+                           updated_at = NOW()
+                       WHERE merchant_id = %s AND user_id = %s
+                       RETURNING merchant_id""",
+                    (logo_url, request.merchant_id, request.user_id)
+                )
+                
+                result = cursor.fetchone()
+                if not result:
+                    raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+                
+                conn.commit()
+                cursor.close()
+                
+                logger.info(f"Updated logo_url in database for merchant: {request.merchant_id}")
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Error updating logo_url in database: {e}")
+                if conn:
+                    conn.rollback()
+                # Don't fail the entire request if database update fails - config was already updated
+            finally:
+                if conn:
+                    return_connection(conn)
+        
+        logger.info(f"Saved custom chatbot configuration for merchant: {request.merchant_id}")
+        
+        return {
+            "merchant_id": request.merchant_id,
+            "status": "saved",
+            "custom_chatbot_saved": True,
+            "config_path": config_update_result["config_path"],
+            "custom_chatbot": config_update_result["config"].get("custom_chatbot", {}),
+            "message": "Custom chatbot configuration saved successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving custom chatbot configuration: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/agents/custom-chatbot")
+async def update_custom_chatbot(request: SaveCustomChatbotRequest):
+    """
+    Update Custom Chatbot Configuration (Step 4 - Edit mode)
+    
+    This is an alias for POST /agents/custom-chatbot.
+    Updates existing custom chatbot configuration.
+    """
+    return await save_custom_chatbot(request)
 
 
 @app.post("/agents/create")
@@ -2593,6 +2973,36 @@ async def get_merchant_config(
         try:
             file_content = gcs_handler.download_file(config_path)
             config = json.loads(file_content.decode('utf-8'))
+            
+            # Generate signed URLs for logos if they exist
+            # Extract GCS path from public URL and generate signed URL (with security validation)
+            if config.get("branding", {}).get("logo_url"):
+                logo_url = config["branding"]["logo_url"]
+                # Extract GCS path from public URL (validates merchant ownership)
+                logo_path = _extract_gcs_path_from_url(logo_url, merchant_id)
+                if logo_path:
+                    try:
+                        signed_url_info = gcs_handler.generate_download_url(logo_path, expiration_minutes=60)
+                        config["branding"]["logo_signed_url"] = signed_url_info.get("download_url")
+                        config["branding"]["logo_url_expires_in"] = signed_url_info.get("expires_in")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate signed URL for branding logo: {e}")
+                        # Keep original URL if signed URL generation fails
+                        config["branding"]["logo_signed_url"] = logo_url
+            
+            if config.get("custom_chatbot", {}).get("logo_signed_url"):
+                logo_url = config["custom_chatbot"]["logo_signed_url"]
+                # Extract GCS path from public URL (validates merchant ownership)
+                logo_path = _extract_gcs_path_from_url(logo_url, merchant_id)
+                if logo_path:
+                    try:
+                        signed_url_info = gcs_handler.generate_download_url(logo_path, expiration_minutes=60)
+                        config["custom_chatbot"]["logo_signed_url"] = signed_url_info.get("download_url")
+                        config["custom_chatbot"]["logo_url_expires_in"] = signed_url_info.get("expires_in")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate signed URL for custom_chatbot logo: {e}")
+                        # Keep original URL if signed URL generation fails
+                        config["custom_chatbot"]["logo_signed_url"] = logo_url
             
             return {
                 "merchant_id": merchant_id,
