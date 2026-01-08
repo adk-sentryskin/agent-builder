@@ -235,6 +235,50 @@ def _extract_gcs_path_from_url(url: str, merchant_id: str) -> Optional[str]:
     return None
 
 
+def _get_custom_chatbot_defaults():
+    """Returns the default values for custom_chatbot fields"""
+    return {
+        "title": "AI Assistant",
+        "logo_signed_url": "",
+        "color": "#667eea",
+        "font_family": "Inter, sans-serif",
+        "tag_line": "",
+        "position": "bottom-right"
+    }
+
+
+def _add_default_metadata(custom_chatbot: dict) -> dict:
+    """
+    Add _is_default metadata to custom_chatbot to indicate which fields are using default values.
+    
+    Args:
+        custom_chatbot: The custom_chatbot dictionary from config
+        
+    Returns:
+        A copy of custom_chatbot with _is_default metadata added
+    """
+    if not custom_chatbot:
+        return custom_chatbot
+    
+    defaults = _get_custom_chatbot_defaults()
+    is_default = {}
+    
+    # Check each field against defaults
+    for field, default_value in defaults.items():
+        current_value = custom_chatbot.get(field)
+        # Consider empty string as default for logo_signed_url and tag_line
+        if field in ["logo_signed_url", "tag_line"]:
+            is_default[field] = (current_value == default_value or current_value == "" or current_value is None)
+        else:
+            is_default[field] = (current_value == default_value)
+    
+    # Create copy and add metadata
+    custom_chatbot_with_meta = custom_chatbot.copy()
+    custom_chatbot_with_meta["_is_default"] = is_default
+    
+    return custom_chatbot_with_meta
+
+
 def generate_merchant_id(shop_name: str) -> str:
     """
     Generate merchant_id from shop_name
@@ -2118,12 +2162,18 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
         
         logger.info(f"Saved custom chatbot configuration for merchant: {request.merchant_id}")
         
+        # Get the updated custom_chatbot
+        custom_chatbot = config_update_result["config"].get("custom_chatbot", {})
+        
+        # Add _is_default metadata for frontend
+        custom_chatbot_with_meta = _add_default_metadata(custom_chatbot)
+        
         return {
             "merchant_id": request.merchant_id,
             "status": "saved",
             "custom_chatbot_saved": True,
             "config_path": config_update_result["config_path"],
-            "custom_chatbot": config_update_result["config"].get("custom_chatbot", {}),
+            "custom_chatbot": custom_chatbot_with_meta,
             "message": "Custom chatbot configuration saved successfully"
         }
     
@@ -3002,6 +3052,10 @@ async def get_merchant_config(
                         logger.warning(f"Failed to generate signed URL for custom_chatbot logo: {e}")
                         # Keep original URL if signed URL generation fails
                         config["custom_chatbot"]["logo_signed_url"] = logo_url
+            
+            # Add _is_default metadata to custom_chatbot for frontend
+            if config.get("custom_chatbot"):
+                config["custom_chatbot"] = _add_default_metadata(config["custom_chatbot"])
             
             return {
                 "merchant_id": merchant_id,
