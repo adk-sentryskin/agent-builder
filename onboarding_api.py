@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system environment variables
 
-from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -275,9 +275,9 @@ class SaveAIPersonaRequest(BaseModel):
     tone_of_voice: Optional[str] = Field(None, description="Tone of Voice (e.g., Friendly)")
     platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, custom)")
     top_questions: Optional[List[str]] = Field(None, description="Top-3 Questions (array of 3 questions)")
-    top_products: Optional[List[str]] = Field(None, description="Top-3 product links to sell/promote")
-    customer_persona: Optional[str] = Field(None, description="Describe your ideal customer persona")
-    system_prompt: Optional[str] = Field(None, description="System Prompt for AI Assistant")
+    top_products: List[str] = Field(..., description="Top-3 product links to sell/promote")
+    customer_persona: str = Field(..., description="Describe your ideal customer persona")
+    system_prompt: str = Field(..., description="System Prompt for AI Assistant")
     is_connected: bool = Field(False, description="Whether the integration is connected")
     
     def get_merchant_id(self) -> str:
@@ -1498,10 +1498,8 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
         if request.top_questions:
             top_questions_str = "\n".join(request.top_questions) if isinstance(request.top_questions, list) else request.top_questions
         
-        # Convert top_products array to string if provided
-        top_products_str = None
-        if request.top_products:
-            top_products_str = "\n".join(request.top_products) if isinstance(request.top_products, list) else request.top_products
+        # Convert top_products array to string (required field)
+        top_products_str = "\n".join(request.top_products) if isinstance(request.top_products, list) else request.top_products
         
         # Create or update merchant with AI Persona data
         success = create_merchant(
@@ -2927,7 +2925,7 @@ async def get_knowledge_base(merchant_id: str, user_id: str):
 @app.get("/merchants/{merchant_id}/config")
 async def get_merchant_config(
     merchant_id: str,
-    user_id: str
+    user_id: Optional[str] = Query(None, description="User identifier (optional)")
 ):
     """
     Get merchant_config.json content
@@ -2936,7 +2934,7 @@ async def get_merchant_config(
     
     Args:
         merchant_id: Merchant identifier
-        user_id: User identifier (query parameter for security)
+        user_id: User identifier (optional query parameter - if provided, verifies ownership)
     
     Response:
     ```json
@@ -2961,10 +2959,11 @@ async def get_merchant_config(
     ```
     """
     try:
-        # Verify merchant access
+        # Get merchant (with optional user_id verification)
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            error_detail = "Merchant not found or access denied" if user_id else "Merchant not found"
+            raise HTTPException(status_code=404, detail=error_detail)
         
         # Get config path
         config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
