@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 # Load environment variables from .env file if available
 try:
@@ -172,6 +173,14 @@ class CreateAgentRequest(BaseModel):
     # Optional overrides if needed
     shop_name: Optional[str] = None
     shop_url: Optional[str] = None
+
+
+class UpdateAgentRequest(BaseModel):
+    """Update Agent - Re-process knowledge base after changes"""
+    merchant_id: str
+    user_id: str
+    update_products: bool = Field(False, description="Re-process products file if it exists")
+    update_categories: bool = Field(False, description="Re-process categories file if it exists")
 
 
 class OnboardRequest(BaseModel):
@@ -730,6 +739,287 @@ async def process_onboarding(
         )
 
 
+# Background processing function for agent updates
+async def process_agent_update(
+    merchant_id: str,
+    user_id: str,
+    update_products: bool = False,
+    update_categories: bool = False
+):
+    """
+    Background task for updating agent after knowledge base changes
+    
+    This re-processes:
+    1. Documents (always - re-converts and re-imports to Vertex AI)
+    2. Products (if update_products=True and products file exists)
+    3. Categories (if update_categories=True and categories file exists)
+    
+    Does NOT re-create datastores or re-run full onboarding.
+    """
+    try:
+        merchant = get_merchant(merchant_id, user_id)
+        if not merchant:
+            logger.error(f"Merchant not found: {merchant_id}")
+            status = status_tracker.get_status(merchant_id)
+            if status:
+                status["status"] = "failed"
+                status["error"] = f"Merchant not found: {merchant_id}"
+                status["updated_at"] = datetime.utcnow().isoformat()
+            return
+        
+        # Mark job as in progress for update
+        status = status_tracker.get_status(merchant_id)
+        if status:
+            status["status"] = "in_progress"
+            status["current_step"] = "update_agent"
+            status["message"] = "Agent update in progress..."
+            status["updated_at"] = datetime.utcnow().isoformat()
+        else:
+            # Create job if it doesn't exist
+            status_tracker.create_job(merchant_id, user_id)
+            status = status_tracker.get_status(merchant_id)
+            if status:
+                status["current_step"] = "update_agent"
+                status["message"] = "Agent update started"
+        
+        shop_url = merchant.get('shop_url')
+        platform = merchant.get('platform')
+        custom_url_pattern = merchant.get('custom_url_pattern')
+        
+        # Step 1: Re-process products if requested and file exists
+        if update_products:
+            products_file_path = None
+            knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+            try:
+                files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+                for file_path in files_in_kb:
+                    filename = file_path.split('/')[-1].lower()
+                    if filename in ['products.json', 'products.csv', 'products.xlsx', 'products.xls']:
+                        products_file_path = file_path
+                        logger.info(f"Found products file for update: {products_file_path}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not scan knowledge_base for products file: {e}")
+            
+            if products_file_path:
+                status_tracker.update_step_status(
+                    merchant_id, "process_products", StepStatus.IN_PROGRESS
+                )
+                try:
+                    result = product_processor.process_products_file(
+                        merchant_id,
+                        products_file_path,
+                        shop_url=shop_url,
+                        platform=platform,
+                        custom_url_pattern=custom_url_pattern
+                    )
+                    update_merchant_onboarding_step(
+                        merchant_id=merchant_id,
+                        step_name='products',
+                        completed=True,
+                        counts={'product_count': result.get('product_count', 0)}
+                    )
+                    status_tracker.update_step_status(
+                        merchant_id, "process_products", StepStatus.COMPLETED,
+                        message=f"Re-processed {result.get('product_count', 0)} products"
+                    )
+                    
+                    # Re-import products to Vertex AI (INCREMENTAL mode)
+                    products_ndjson_path = f"merchants/{merchant_id}/training_files/products.ndjson"
+                    if gcs_handler.file_exists(products_ndjson_path):
+                        try:
+                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{products_ndjson_path}"
+                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Re-imported products to Vertex AI for merchant: {merchant_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to re-import products to Vertex AI: {e}")
+                            # Log error but continue - Vertex AI import failures don't stop the update
+                except Exception as e:
+                    logger.error(f"Error re-processing products: {e}")
+                    update_merchant_onboarding_step(
+                        merchant_id=merchant_id,
+                        step_name='products',
+                        completed=False,
+                        error=str(e)
+                    )
+                    status_tracker.update_step_status(
+                        merchant_id, "process_products", StepStatus.FAILED,
+                        error=str(e)
+                    )
+            else:
+                status_tracker.update_step_status(
+                    merchant_id, "process_products", StepStatus.SKIPPED,
+                    message="No products file found in knowledge_base"
+                )
+        
+        # Step 2: Re-process categories if requested and file exists
+        if update_categories:
+            categories_file_path = None
+            knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+            try:
+                files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+                for file_path in files_in_kb:
+                    filename = file_path.split('/')[-1].lower()
+                    if filename in ['categories.csv', 'categories.xlsx', 'categories.xls']:
+                        categories_file_path = file_path
+                        logger.info(f"Found categories file for update: {categories_file_path}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not scan knowledge_base for categories file: {e}")
+            
+            if categories_file_path:
+                status_tracker.update_step_status(
+                    merchant_id, "process_categories", StepStatus.IN_PROGRESS
+                )
+                try:
+                    result = product_processor.process_categories_file(merchant_id, categories_file_path)
+                    update_merchant_onboarding_step(
+                        merchant_id=merchant_id,
+                        step_name='categories',
+                        completed=True,
+                        counts={'category_count': result.get('category_count', 0)}
+                    )
+                    status_tracker.update_step_status(
+                        merchant_id, "process_categories", StepStatus.COMPLETED,
+                        message=f"Re-processed {result.get('category_count', 0)} categories"
+                    )
+                    
+                    # Re-import categories to Vertex AI (INCREMENTAL mode)
+                    categories_ndjson_path = f"merchants/{merchant_id}/training_files/categories.ndjson"
+                    if gcs_handler.file_exists(categories_ndjson_path):
+                        try:
+                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{categories_ndjson_path}"
+                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Re-imported categories to Vertex AI for merchant: {merchant_id}")
+                        except Exception as e:
+                            logger.error(f"Failed to re-import categories to Vertex AI: {e}")
+                            # Log error but continue - Vertex AI import failures don't stop the update
+                except Exception as e:
+                    logger.error(f"Error re-processing categories: {e}")
+                    update_merchant_onboarding_step(
+                        merchant_id=merchant_id,
+                        step_name='categories',
+                        completed=False,
+                        error=str(e)
+                    )
+                    status_tracker.update_step_status(
+                        merchant_id, "process_categories", StepStatus.FAILED,
+                        error=str(e)
+                    )
+            else:
+                status_tracker.update_step_status(
+                    merchant_id, "process_categories", StepStatus.SKIPPED,
+                    message="No categories file found in knowledge_base"
+                )
+        
+        # Step 3: Re-convert documents (always - knowledge base files may have changed)
+        document_paths = []
+        knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+        try:
+            files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+            excluded_files = ['products.json', 'products.csv', 'products.xlsx', 'products.xls',
+                            'categories.csv', 'categories.xlsx', 'categories.xls']
+            for file_path in files_in_kb:
+                filename = file_path.split('/')[-1].lower()
+                if filename not in excluded_files and not filename.endswith('.keep'):
+                    document_paths.append(file_path)
+        except Exception as e:
+            logger.warning(f"Could not scan knowledge_base for documents: {e}")
+        
+        if document_paths:
+            status_tracker.update_step_status(
+                merchant_id, "convert_documents", StepStatus.IN_PROGRESS
+            )
+            try:
+                result = document_converter.convert_documents(merchant_id, document_paths)
+                
+                if result.get('document_count', 0) > 0:
+                    update_merchant_onboarding_step(
+                        merchant_id=merchant_id,
+                        step_name='documents',
+                        completed=True,
+                        counts={'document_count': result.get('document_count', 0)}
+                    )
+                    status_tracker.update_step_status(
+                        merchant_id, "convert_documents", StepStatus.COMPLETED,
+                        message=f"Re-converted {result.get('document_count', 0)} documents"
+                    )
+                    
+                    # Re-import documents to Vertex AI (INCREMENTAL mode - adds/updates only)
+                    documents_ndjson_path = f"merchants/{merchant_id}/training_files/documents.ndjson"
+                    if gcs_handler.file_exists(documents_ndjson_path):
+                        try:
+                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{documents_ndjson_path}"
+                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Re-imported documents to Vertex AI for merchant: {merchant_id}")
+                            # Update job status to indicate Vertex AI update completed
+                            status = status_tracker.get_status(merchant_id)
+                            if status:
+                                status["message"] = "Documents re-imported to Vertex AI successfully"
+                                status["updated_at"] = datetime.utcnow().isoformat()
+                        except Exception as e:
+                            logger.error(f"Failed to re-import documents to Vertex AI: {e}")
+                            # Log error but continue - Vertex AI import failures don't stop the update
+                            # Update job status to indicate partial failure
+                            status = status_tracker.get_status(merchant_id)
+                            if status:
+                                status["message"] = f"Documents re-converted but Vertex AI import failed: {str(e)}"
+                                status["updated_at"] = datetime.utcnow().isoformat()
+                else:
+                    status_tracker.update_step_status(
+                        merchant_id, "convert_documents", StepStatus.SKIPPED,
+                        message="No documents were successfully converted"
+                    )
+            except Exception as e:
+                logger.error(f"Error re-converting documents: {e}")
+                update_merchant_onboarding_step(
+                    merchant_id=merchant_id,
+                    step_name='documents',
+                    completed=False,
+                    error=str(e)
+                )
+                status_tracker.update_step_status(
+                    merchant_id, "convert_documents", StepStatus.FAILED,
+                    error=str(e)
+                )
+        else:
+            status_tracker.update_step_status(
+                merchant_id, "convert_documents", StepStatus.SKIPPED,
+                message="No documents found in knowledge_base to re-process"
+            )
+        
+        # Mark update as completed
+        status = status_tracker.get_status(merchant_id)
+        if status:
+            status["status"] = "completed"
+            status["current_step"] = None
+            status["message"] = "Agent update completed successfully"
+            status["progress"] = 100
+            status["updated_at"] = datetime.utcnow().isoformat()
+        
+        logger.info(f"Agent update completed for merchant: {merchant_id}")
+    
+    except Exception as e:
+        logger.error(f"Error in agent update process for merchant {merchant_id}: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        
+        # Mark job as failed
+        status = status_tracker.get_status(merchant_id)
+        if status:
+            status["status"] = "failed"
+            status["error"] = str(e)
+            status["updated_at"] = datetime.utcnow().isoformat()
+        
+        # Update database with error
+        update_merchant_onboarding_step(
+            merchant_id=merchant_id,
+            step_name='onboarding',
+            completed=False,
+            error=f"Agent update failed: {str(e)}"
+        )
+
+
 # API Endpoints
 
 @app.get("/")
@@ -750,6 +1040,7 @@ async def root():
             "update_knowledge_base_file": "PATCH /agents/knowledge-base/file",
             "delete_knowledge_base_file": "DELETE /agents/knowledge-base/file",
             "create_agent": "/agents/create",
+            "update_agent": "/agents/update",
             "list_agents": "/agents",
             "onboard": "/onboard",
             "status": "/onboard-status/{merchant_id}",
@@ -1609,6 +1900,109 @@ async def create_agent(
         raise
     except Exception as e:
         logger.error(f"Error creating agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agents/update")
+async def update_agent(
+    request: UpdateAgentRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Update Agent - Re-process knowledge base after changes
+    
+    This endpoint is used when knowledge base files are added, updated, or deleted.
+    It re-processes only the necessary parts without full onboarding.
+    
+    What this endpoint does:
+    1. Validates that agent exists (agent_created = TRUE)
+    2. Validates that knowledge base is saved
+    3. Re-converts documents from knowledge_base folder
+    4. Re-imports documents to Vertex AI (INCREMENTAL mode - adds/updates only)
+    5. Optionally re-processes products/categories if requested
+    
+    What this endpoint does NOT do:
+    - ❌ Re-create datastores (they already exist)
+    - ❌ Re-process website crawling
+    - ❌ Re-generate config (uses existing)
+    - ❌ Re-create merchant record
+    
+    This is a lightweight update compared to full onboarding.
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier
+        update_products: Whether to re-process products file (default: false)
+        update_categories: Whether to re-process categories file (default: false)
+    
+    Returns:
+        job_id, merchant_id, status, status_url
+    """
+    try:
+        # Check if user has active subscription
+        if not check_subscription(request.user_id):
+            raise HTTPException(
+                status_code=402,
+                detail="Active subscription required to update agents. Please upgrade your plan."
+            )
+        
+        # Get merchant from database
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        # Validate agent exists
+        if not merchant.get('agent_created'):
+            raise HTTPException(
+                status_code=400,
+                detail="Agent not created yet. Please create agent first using POST /agents/create"
+            )
+        
+        # Validate knowledge base is saved
+        if not merchant.get('knowledge_base_saved'):
+            raise HTTPException(
+                status_code=400,
+                detail="Knowledge Base not saved. Please save knowledge base first using POST /agents/knowledge-base"
+            )
+        
+        # Create or reuse job in status tracker
+        existing_status = status_tracker.get_status(request.merchant_id)
+        if not existing_status:
+            status_tracker.create_job(request.merchant_id, request.user_id)
+        
+        # Mark job as in progress for update
+        status = status_tracker.get_status(request.merchant_id)
+        if status:
+            status["status"] = "in_progress"
+            status["current_step"] = "update_agent"
+            status["updated_at"] = datetime.utcnow().isoformat()
+            status["message"] = "Agent update started. Re-processing knowledge base files..."
+        
+        job_id = status.get("job_id", f"update_{request.merchant_id}_{int(datetime.utcnow().timestamp())}")
+        
+        # Start background update processing
+        background_tasks.add_task(
+            process_agent_update,
+            merchant_id=request.merchant_id,
+            user_id=request.user_id,
+            update_products=request.update_products,
+            update_categories=request.update_categories
+        )
+        
+        logger.info(f"Started agent update job {job_id} for merchant {request.merchant_id}")
+        
+        return {
+            "job_id": job_id,
+            "merchant_id": request.merchant_id,
+            "status": "update_started",
+            "status_url": f"/onboard-status/{request.merchant_id}",
+            "message": "Agent update started. This will re-process knowledge base files and update Vertex AI."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting agent update: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
