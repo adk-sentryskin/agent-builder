@@ -1363,10 +1363,18 @@ async def get_upload_url(
     try:
         # Verify user owns merchant_id
         if not verify_merchant_access(merchant_id, user_id):
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied: You don't have permission to upload files for this merchant"
-            )
+            # Check if merchant exists at all
+            merchant_check = get_merchant(merchant_id, None)
+            if merchant_check:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied: This merchant belongs to a different user. Please use the correct merchant_id for your account."
+                )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Merchant '{merchant_id}' not found. Please complete Step 1 (Save AI Persona) first to create the merchant, then you can upload files."
+                )
         
         url_info = gcs_handler.generate_upload_url(
             merchant_id=merchant_id,
@@ -1378,9 +1386,14 @@ async def get_upload_url(
         return url_info
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error generating upload URL: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e) if e else "Unknown error occurred"
+        logger.error(f"Error generating upload URL: {error_msg}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 
 @app.post("/files/upload-urls")
@@ -1406,10 +1419,18 @@ async def get_bulk_upload_urls(
     try:
         # Verify user owns merchant_id
         if not verify_merchant_access(merchant_id, user_id):
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied: You don't have permission to upload files for this merchant"
-            )
+            # Check if merchant exists at all
+            merchant_check = get_merchant(merchant_id, None)
+            if merchant_check:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied: This merchant belongs to a different user. Please use the correct merchant_id for your account."
+                )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Merchant '{merchant_id}' not found. Please complete Step 1 (Save AI Persona) first to create the merchant, then you can upload files."
+                )
         
         import json
         files_list = json.loads(files)
@@ -1522,26 +1543,30 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
         
         # Mark AI Persona as saved
-        # Check if merchant is connected via get_crm_integrations
+        # Always set this flag when AI Persona is saved, regardless of CRM connection status
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
+                (merchant_id, request.user_id)
+            )
+            conn.commit()
+            cursor.close()
+            logger.info(f"Marked ai_persona_saved = TRUE for merchant: {merchant_id}")
+        except Exception as e:
+            logger.error(f"Error updating ai_persona_saved flag: {e}")
+        finally:
+            if conn:
+                return_connection(conn)
+        
+        # Check if merchant is connected via CRM (for informational purposes)
         is_connected = get_crm_integrations(merchant_id)
         if is_connected:
-            conn = None
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
-                    (merchant_id, request.user_id)
-                )
-                conn.commit()
-                cursor.close()
-            except Exception as e:
-                logger.error(f"Error updating ai_persona_saved flag: {e}")
-            finally:
-                if conn:
-                    return_connection(conn)
+            logger.info(f"Merchant {merchant_id} has CRM integration connected")
         else:
-            logger.info(f"Skipping ai_persona_saved update for merchant {merchant_id} (CRM integration not connected)")
+            logger.info(f"Merchant {merchant_id} does not have CRM integration (AI Persona still saved)")
         
         # Create folder structure immediately after saving AI Persona
         # This ensures folders exist before file uploads in Step 2

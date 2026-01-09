@@ -95,7 +95,10 @@ class GCSHandler:
             logger.warning("GCS_CLIENT_EMAIL not found in environment")
         
         if gcs_private_key:
-            logger.info(f"Found GCS_PRIVATE_KEY (length: {len(gcs_private_key)})")
+            key_length = len(gcs_private_key)
+            has_begin = "BEGIN PRIVATE KEY" in gcs_private_key
+            has_end = "END PRIVATE KEY" in gcs_private_key
+            logger.info(f"Found GCS_PRIVATE_KEY (length: {key_length}, has BEGIN: {has_begin}, has END: {has_end})")
         else:
             logger.warning("GCS_PRIVATE_KEY not found in environment")
         
@@ -171,6 +174,17 @@ class GCSHandler:
         object_path = f"merchants/{merchant_id}/{folder}/{filename}"
 
         try:
+            # Check if credentials are available and have private key
+            if not hasattr(self.client, '_credentials'):
+                logger.warning("Storage client does not have credentials attribute")
+            else:
+                creds = self.client._credentials
+                if hasattr(creds, 'private_key'):
+                    has_key = creds.private_key is not None
+                    logger.debug(f"Credentials have private_key: {has_key}")
+                else:
+                    logger.warning("Credentials object does not have private_key attribute")
+            
             # Generate signed URL
             blob = self.bucket.blob(object_path)
 
@@ -193,8 +207,32 @@ class GCSHandler:
                 }
             }
         except Exception as e:
-            logger.error(f"Error generating signed URL: {e}")
-            raise
+            error_msg = str(e) if e else "Unknown error"
+            error_type = type(e).__name__
+            
+            # Get more details about the exception
+            error_repr = repr(e) if e else "None"
+            
+            # Check for common credential issues
+            if "private key" in error_msg.lower() or "credentials" in error_msg.lower() or "Reauthentication" in error_msg or "you need a private key" in error_msg.lower():
+                detailed_error = (
+                    f"GCS credentials error: {error_msg}. "
+                    f"To generate signed URLs, you need a service account with a private key. "
+                    f"Please check your .env file and ensure:"
+                    f"\n  1. GCS_CLIENT_EMAIL is set to your service account email"
+                    f"\n  2. GCS_PRIVATE_KEY is set with the full private key (including BEGIN/END lines)"
+                    f"\n  3. The private key in .env should have actual newlines or \\n escapes"
+                    f"\n\nAlternatively, set GOOGLE_APPLICATION_CREDENTIALS to a service account JSON file path."
+                )
+            else:
+                detailed_error = f"Error generating signed URL ({error_type}): {error_msg}"
+                if error_repr != error_msg:
+                    detailed_error += f"\nException details: {error_repr}"
+            
+            logger.error(f"Error generating signed URL: {detailed_error}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            raise ValueError(detailed_error) from e
 
     def generate_download_url(
         self,

@@ -572,6 +572,13 @@ def verify_merchant_access(merchant_id: str, user_id: str) -> bool:
         True if merchant belongs to user
     """
     merchant = get_merchant(merchant_id, user_id)
+    if merchant is None:
+        # Check if merchant exists but belongs to different user
+        merchant_any_user = get_merchant(merchant_id, None)
+        if merchant_any_user:
+            logger.warning(f"Merchant {merchant_id} exists but belongs to different user (not {user_id})")
+        else:
+            logger.warning(f"Merchant {merchant_id} does not exist. User must complete Step 1 (Save AI Persona) first.")
     return merchant is not None
 
 

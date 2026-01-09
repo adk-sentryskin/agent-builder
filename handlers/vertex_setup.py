@@ -231,7 +231,7 @@ class VertexSetup:
            - Used for: SiteSearchEngine crawling
            
         2. Documents datastore ({merchant_id}-docs-engine): For NDJSON document imports
-           - ContentConfig: NO_CONTENT
+           - ContentConfig: CONTENT_REQUIRED (documents have content that needs to be indexed)
            - Used for: Knowledge base documents, products, categories
 
         Args:
@@ -277,7 +277,7 @@ class VertexSetup:
                     datastore_id=docs_datastore_id,
                     datastore_path=docs_datastore_path,
                     display_name=f"{display_name} - Documents",
-                    content_config=vertex.DataStore.ContentConfig.NO_CONTENT,
+                    content_config=vertex.DataStore.ContentConfig.CONTENT_REQUIRED,
                     shop_url=None,  # No website crawling for documents datastore
                     parent=parent
                 )
@@ -306,7 +306,7 @@ class VertexSetup:
             datastore_id: Datastore ID
             datastore_path: Full datastore path
             display_name: Display name for the datastore
-            content_config: Content configuration (PUBLIC_WEBSITE or NO_CONTENT)
+            content_config: Content configuration (PUBLIC_WEBSITE, CONTENT_REQUIRED, or NO_CONTENT)
             shop_url: Optional website URL (only for PUBLIC_WEBSITE)
             parent: Parent path for datastore creation
 
@@ -805,13 +805,29 @@ class VertexSetup:
             # CRITICAL: Path must be: dataStores/{datastore}/branches/default_branch
             parent = f"{datastore_path}/branches/default_branch"
             
-            # CRITICAL FIX: Verify datastore exists with retry
+            # CRITICAL FIX: Verify datastore exists with retry and check content config
             try:
                 datastore = self.datastore_client.get_data_store(
                     name=datastore_path,
                     retry=retries.Retry()
                 )
                 logger.info(f"Verified datastore exists: {datastore_id}")
+                
+                # CRITICAL: Verify content_config is CONTENT_REQUIRED for documents with content
+                if datastore.content_config != vertex.DataStore.ContentConfig.CONTENT_REQUIRED:
+                    current_config = datastore.content_config.name if datastore.content_config else "None"
+                    error_msg = (
+                        f"❌ CONTENT_CONFIG_MISMATCH: Datastore '{datastore_id}' has content_config='{current_config}' "
+                        f"but requires 'CONTENT_REQUIRED' to import documents with content.\n"
+                        f"SOLUTION:\n"
+                        f"1. Delete the existing datastore '{datastore_id}' (if empty) OR\n"
+                        f"2. Delete the datastore and recreate it - the system will now create it with CONTENT_REQUIRED automatically.\n"
+                        f"Note: Datastore content_config cannot be modified after creation.\n"
+                        f"Error: '[google.cloud.discoveryengine.v1.DocumentService.ImportDocuments] To create document with content, "
+                        f"the content config of data store must be CONTENT_REQUIRED.'"
+                    )
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
             except Exception as check_error:
                 error_msg = str(check_error)
                 # Check if it's a permission error or not found
