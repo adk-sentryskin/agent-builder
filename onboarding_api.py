@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system environment variables
 
-from fastapi import FastAPI, HTTPException, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -235,6 +235,50 @@ def _extract_gcs_path_from_url(url: str, merchant_id: str) -> Optional[str]:
     return None
 
 
+def _get_custom_chatbot_defaults():
+    """Returns the default values for custom_chatbot fields"""
+    return {
+        "title": "AI Assistant",
+        "logo_signed_url": "",
+        "color": "#667eea",
+        "font_family": "Inter, sans-serif",
+        "tag_line": "",
+        "position": "bottom-right"
+    }
+
+
+def _add_default_metadata(custom_chatbot: dict) -> dict:
+    """
+    Add _is_default metadata to custom_chatbot to indicate which fields are using default values.
+    
+    Args:
+        custom_chatbot: The custom_chatbot dictionary from config
+        
+    Returns:
+        A copy of custom_chatbot with _is_default metadata added
+    """
+    if not custom_chatbot:
+        return custom_chatbot
+    
+    defaults = _get_custom_chatbot_defaults()
+    is_default = {}
+    
+    # Check each field against defaults
+    for field, default_value in defaults.items():
+        current_value = custom_chatbot.get(field)
+        # Consider empty string as default for logo_signed_url and tag_line
+        if field in ["logo_signed_url", "tag_line"]:
+            is_default[field] = (current_value == default_value or current_value == "" or current_value is None)
+        else:
+            is_default[field] = (current_value == default_value)
+    
+    # Create copy and add metadata
+    custom_chatbot_with_meta = custom_chatbot.copy()
+    custom_chatbot_with_meta["_is_default"] = is_default
+    
+    return custom_chatbot_with_meta
+
+
 def generate_merchant_id(shop_name: str) -> str:
     """
     Generate merchant_id from shop_name
@@ -275,9 +319,9 @@ class SaveAIPersonaRequest(BaseModel):
     tone_of_voice: Optional[str] = Field(None, description="Tone of Voice (e.g., Friendly)")
     platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, custom)")
     top_questions: Optional[List[str]] = Field(None, description="Top-3 Questions (array of 3 questions)")
-    top_products: Optional[List[str]] = Field(None, description="Top-3 product links to sell/promote")
-    customer_persona: Optional[str] = Field(None, description="Describe your ideal customer persona")
-    system_prompt: Optional[str] = Field(None, description="System Prompt for AI Assistant")
+    top_products: List[str] = Field(..., description="Top-3 product links to sell/promote")
+    customer_persona: str = Field(..., description="Describe your ideal customer persona")
+    system_prompt: str = Field(..., description="System Prompt for AI Assistant")
     is_connected: bool = Field(False, description="Whether the integration is connected")
     
     def get_merchant_id(self) -> str:
@@ -1519,10 +1563,8 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
         if request.top_questions:
             top_questions_str = "\n".join(request.top_questions) if isinstance(request.top_questions, list) else request.top_questions
         
-        # Convert top_products array to string if provided
-        top_products_str = None
-        if request.top_products:
-            top_products_str = "\n".join(request.top_products) if isinstance(request.top_products, list) else request.top_products
+        # Convert top_products array to string (required field)
+        top_products_str = "\n".join(request.top_products) if isinstance(request.top_products, list) else request.top_products
         
         # Create or update merchant with AI Persona data
         success = create_merchant(
@@ -2145,12 +2187,18 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
         
         logger.info(f"Saved custom chatbot configuration for merchant: {request.merchant_id}")
         
+        # Get the updated custom_chatbot
+        custom_chatbot = config_update_result["config"].get("custom_chatbot", {})
+        
+        # Add _is_default metadata for frontend
+        custom_chatbot_with_meta = _add_default_metadata(custom_chatbot)
+        
         return {
             "merchant_id": request.merchant_id,
             "status": "saved",
             "custom_chatbot_saved": True,
             "config_path": config_update_result["config_path"],
-            "custom_chatbot": config_update_result["config"].get("custom_chatbot", {}),
+            "custom_chatbot": custom_chatbot_with_meta,
             "message": "Custom chatbot configuration saved successfully"
         }
     
@@ -2952,7 +3000,7 @@ async def get_knowledge_base(merchant_id: str, user_id: str):
 @app.get("/merchants/{merchant_id}/config")
 async def get_merchant_config(
     merchant_id: str,
-    user_id: str
+    user_id: Optional[str] = Query(None, description="User identifier (optional)")
 ):
     """
     Get merchant_config.json content
@@ -2961,7 +3009,7 @@ async def get_merchant_config(
     
     Args:
         merchant_id: Merchant identifier
-        user_id: User identifier (query parameter for security)
+        user_id: User identifier (optional query parameter - if provided, verifies ownership)
     
     Response:
     ```json
@@ -2986,10 +3034,11 @@ async def get_merchant_config(
     ```
     """
     try:
-        # Verify merchant access
+        # Get merchant (with optional user_id verification)
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            error_detail = "Merchant not found or access denied" if user_id else "Merchant not found"
+            raise HTTPException(status_code=404, detail=error_detail)
         
         # Get config path
         config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
@@ -3028,6 +3077,10 @@ async def get_merchant_config(
                         logger.warning(f"Failed to generate signed URL for custom_chatbot logo: {e}")
                         # Keep original URL if signed URL generation fails
                         config["custom_chatbot"]["logo_signed_url"] = logo_url
+            
+            # Add _is_default metadata to custom_chatbot for frontend
+            if config.get("custom_chatbot"):
+                config["custom_chatbot"] = _add_default_metadata(config["custom_chatbot"])
             
             return {
                 "merchant_id": merchant_id,
