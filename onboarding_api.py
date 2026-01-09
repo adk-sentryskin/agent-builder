@@ -3000,7 +3000,7 @@ async def get_knowledge_base(merchant_id: str, user_id: str):
 @app.get("/merchants/{merchant_id}/config")
 async def get_merchant_config(
     merchant_id: str,
-    user_id: Optional[str] = Query(None, description="User identifier (optional)")
+    user_id: Optional[str] = Query(default=None, description="User identifier (optional)")
 ):
     """
     Get merchant_config.json content
@@ -3034,14 +3034,17 @@ async def get_merchant_config(
     ```
     """
     try:
-        # Get merchant (with optional user_id verification)
-        merchant = get_merchant(merchant_id, user_id)
-        if not merchant:
-            error_detail = "Merchant not found or access denied" if user_id else "Merchant not found"
-            raise HTTPException(status_code=404, detail=error_detail)
-        
-        # Get config path
-        config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
+        # Get config path - if user_id provided, verify ownership; otherwise use default path
+        config_path = None
+        if user_id:
+            # Verify merchant ownership when user_id is provided
+            merchant = get_merchant(merchant_id, user_id)
+            if not merchant:
+                raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
+        else:
+            # If user_id not provided, use default config path (public access)
+            config_path = f"merchants/{merchant_id}/merchant_config.json"
         
         # Download and parse config
         try:
