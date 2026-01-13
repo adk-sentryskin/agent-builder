@@ -1583,32 +1583,30 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
         
         if not success:
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
-        
-        # Mark AI Persona as saved
-        # Always set this flag when AI Persona is saved, regardless of CRM connection status
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
-                (merchant_id, request.user_id)
-            )
-            conn.commit()
-            cursor.close()
-            logger.info(f"Marked ai_persona_saved = TRUE for merchant: {merchant_id}")
-        except Exception as e:
-            logger.error(f"Error updating ai_persona_saved flag: {e}")
-        finally:
-            if conn:
-                return_connection(conn)
-        
-        # Check if merchant is connected via CRM (for informational purposes)
+
+        # Check if merchant is connected via CRM
         is_connected = get_crm_integrations(merchant_id)
+
+        # Mark AI Persona as saved only if merchant is connected
         if is_connected:
-            logger.info(f"Merchant {merchant_id} has CRM integration connected")
+            conn = None
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE merchants SET ai_persona_saved = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
+                    (merchant_id, request.user_id)
+                )
+                conn.commit()
+                cursor.close()
+                logger.info(f"Marked ai_persona_saved = TRUE for merchant: {merchant_id}")
+            except Exception as e:
+                logger.error(f"Error updating ai_persona_saved flag: {e}")
+            finally:
+                if conn:
+                    return_connection(conn)
         else:
-            logger.info(f"Merchant {merchant_id} does not have CRM integration (AI Persona still saved)")
+            logger.info(f"Merchant {merchant_id} does not have CRM integration connected - ai_persona_saved not updated")
         
         # Create folder structure immediately after saving AI Persona
         # This ensures folders exist before file uploads in Step 2
