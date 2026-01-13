@@ -322,10 +322,10 @@ def get_crm_integrations(merchant_id: str) -> bool:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Query merchants table in shopify_sync schema to check if access token exists
+        # Query shopify_stores table in shopify_sync schema to check if access token exists
         query = """
             SELECT access_token
-            FROM shopify_sync.merchants
+            FROM shopify_sync.shopify_stores
             WHERE merchant_id = %s
         """
 
@@ -642,7 +642,7 @@ def get_user_merchants_with_connection_status(user_id: str) -> list:
                     ELSE false
                 END as is_connected
             FROM merchants m
-            LEFT JOIN shopify_sync.merchants sm ON m.merchant_id = sm.merchant_id
+            LEFT JOIN shopify_sync.shopify_stores sm ON m.merchant_id = sm.merchant_id
             WHERE m.user_id = %s
             ORDER BY m.updated_at DESC
         """
