@@ -3067,8 +3067,10 @@ async def get_merchant_config(
                         # Keep original URL if signed URL generation fails
                         config["branding"]["logo_signed_url"] = logo_url
             
-            if config.get("custom_chatbot", {}).get("logo_signed_url"):
-                logo_url = config["custom_chatbot"]["logo_signed_url"]
+            # Check for logo in custom_chatbot - check both logo_signed_url and logo_url fields
+            custom_chatbot = config.get("custom_chatbot", {})
+            logo_url = custom_chatbot.get("logo_signed_url") or custom_chatbot.get("logo_url")
+            if logo_url and logo_url.strip():  # Check if logo_url exists and is not empty
                 # Extract GCS path from public URL (validates merchant ownership)
                 logo_path = _extract_gcs_path_from_url(logo_url, merchant_id)
                 if logo_path:
@@ -3080,6 +3082,10 @@ async def get_merchant_config(
                         logger.warning(f"Failed to generate signed URL for custom_chatbot logo: {e}")
                         # Keep original URL if signed URL generation fails
                         config["custom_chatbot"]["logo_signed_url"] = logo_url
+                else:
+                    # If path extraction failed, keep original URL
+                    logger.warning(f"Could not extract GCS path from logo URL: {logo_url}")
+                    config["custom_chatbot"]["logo_signed_url"] = logo_url
             
             # Add _is_default metadata to custom_chatbot for frontend
             if config.get("custom_chatbot"):
