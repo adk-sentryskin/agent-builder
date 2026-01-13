@@ -333,10 +333,23 @@ def get_crm_integrations(merchant_id: str) -> bool:
         result = cursor.fetchone()
         cursor.close()
 
+        # Debug logging
+        logger.info(f"[is_connected] merchant_id: {merchant_id}")
+        logger.info(f"[is_connected] Query result: {result}")
+        if result:
+            access_token = result.get('access_token')
+            logger.info(f"[is_connected] access_token exists: {access_token is not None}")
+            logger.info(f"[is_connected] access_token length: {len(access_token) if access_token else 0}")
+            logger.info(f"[is_connected] access_token empty check: {bool(access_token)}")
+        else:
+            logger.info(f"[is_connected] No record found in shopify_sync.shopify_stores")
+
         # Check if merchant exists and has access_token
         if result and result.get('access_token'):
+            logger.info(f"[is_connected] Returning TRUE for merchant: {merchant_id}")
             return True
         else:
+            logger.info(f"[is_connected] Returning FALSE for merchant: {merchant_id}")
             return False
 
     except Exception as e:
