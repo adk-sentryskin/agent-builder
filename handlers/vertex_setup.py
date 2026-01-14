@@ -870,7 +870,7 @@ class VertexSetup:
             logger.info(f"Starting document import from: {gcs_uri} (schema: {data_schema})")
             operation = self.client.import_documents(request=request)
             
-            # Get operation name safely (optional - not critical)
+            # Get operation name safely (required for status checking)
             operation_name = None
             try:
                 if hasattr(operation, 'operation'):
@@ -885,15 +885,20 @@ class VertexSetup:
                         operation_name = metadata['name']
                     elif hasattr(metadata, 'name'):
                         operation_name = metadata.name
+                # Try to get from operation directly
+                if not operation_name and hasattr(operation, 'name'):
+                    operation_name = operation.name
             except Exception as name_error:
                 logger.debug(f"Could not extract operation name: {name_error}")
             
             if operation_name:
                 logger.info(f"Started document import operation: {operation_name}")
             else:
-                logger.info("Started document import operation (name not available)")
+                logger.warning("Started document import operation but could not extract operation name")
+                # Try to construct operation name from parent
+                operation_name = f"{parent}/operations/import-documents-unknown"
 
-            # Wait for operation to complete
+            # Wait for operation to complete (only if not async mode)
             try:
                 result = operation.result(timeout=1800)  # 30 minute timeout
                 logger.info(f"✅ Document import operation completed")
@@ -960,6 +965,179 @@ class VertexSetup:
             logger.debug(f"Traceback: {traceback.format_exc()}")
             raise
 
+    def start_import_documents_async(
+        self,
+        merchant_id: str,
+        gcs_uri: str,
+        import_type: str = "FULL",
+        data_schema: Optional[str] = None,
+        use_documents_datastore: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Start document import without waiting for completion (async)
+        
+        Returns immediately with operation name for status checking.
+        Use check_import_status() to check if import completed.
+        
+        Args:
+            merchant_id: Merchant identifier
+            gcs_uri: GCS URI of NDJSON file (gs://bucket/path)
+            import_type: Import type (FULL or INCREMENTAL)
+            data_schema: Optional data schema ("document" or "content"). If not provided, will auto-detect.
+            use_documents_datastore: If True, use docs-engine datastore (default). If False, use legacy engine.
+        
+        Returns:
+            dict with operation_name and status="started"
+        """
+        try:
+            # CRITICAL: Use documents datastore for NDJSON imports
+            if use_documents_datastore:
+                datastore_id = f"{merchant_id}-docs-engine"
+            else:
+                datastore_id = f"{merchant_id}-engine"
+            
+            datastore_path = f"projects/{self.project_id}/locations/{self.location}/collections/{self.collection_id}/dataStores/{datastore_id}"
+            parent = f"{datastore_path}/branches/default_branch"
+            
+            # Verify datastore exists
+            try:
+                datastore = self.datastore_client.get_data_store(
+                    name=datastore_path,
+                    retry=retries.Retry()
+                )
+                logger.info(f"Verified datastore exists: {datastore_id}")
+                
+                if datastore.content_config != vertex.DataStore.ContentConfig.CONTENT_REQUIRED:
+                    current_config = datastore.content_config.name if datastore.content_config else "None"
+                    raise Exception(
+                        f"Datastore '{datastore_id}' has content_config='{current_config}' "
+                        f"but requires 'CONTENT_REQUIRED' to import documents with content."
+                    )
+            except Exception as check_error:
+                error_msg = str(check_error)
+                if "IAM_PERMISSION_DENIED" in error_msg or "Permission" in error_msg:
+                    sa_email = getattr(self, '_service_account_email', 'Unknown')
+                    raise Exception(
+                        f"Permission denied accessing datastore '{datastore_id}'. "
+                        f"Service account: {sa_email}. Error: {error_msg}"
+                    )
+                elif "404" in error_msg or "not found" in error_msg.lower():
+                    raise Exception(f"Datastore '{datastore_id}' not found. Error: {error_msg}")
+                else:
+                    raise
+            
+            # Auto-detect data_schema if not provided
+            if data_schema is None:
+                data_schema = self._detect_data_schema(gcs_uri)
+            
+            # Create import request
+            gcs_source = vertex.GcsSource(
+                input_uris=[gcs_uri] if isinstance(gcs_uri, str) else gcs_uri,
+                data_schema=data_schema
+            )
+            
+            request = vertex.ImportDocumentsRequest(
+                parent=parent,
+                gcs_source=gcs_source,
+                reconciliation_mode=vertex.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+                if import_type == "INCREMENTAL"
+                else vertex.ImportDocumentsRequest.ReconciliationMode.FULL
+            )
+            
+            # Start import operation (don't wait)
+            logger.info(f"Starting async document import from: {gcs_uri} (schema: {data_schema})")
+            operation = self.client.import_documents(request=request)
+            
+            # Extract operation name
+            operation_name = None
+            try:
+                if hasattr(operation, 'operation'):
+                    op_obj = operation.operation
+                    if isinstance(op_obj, dict):
+                        operation_name = op_obj.get('name')
+                    elif hasattr(op_obj, 'name'):
+                        operation_name = op_obj.name
+                if not operation_name and hasattr(operation, 'metadata'):
+                    metadata = operation.metadata
+                    if isinstance(metadata, dict) and 'name' in metadata:
+                        operation_name = metadata['name']
+                    elif hasattr(metadata, 'name'):
+                        operation_name = metadata.name
+                if not operation_name and hasattr(operation, 'name'):
+                    operation_name = operation.name
+            except Exception as name_error:
+                logger.warning(f"Could not extract operation name: {name_error}")
+            
+            if not operation_name:
+                # Construct fallback operation name
+                operation_name = f"{parent}/operations/import-documents-{int(__import__('time').time())}"
+                logger.warning(f"Using fallback operation name: {operation_name}")
+            
+            logger.info(f"✅ Started async document import operation: {operation_name}")
+            
+            return {
+                "operation_name": operation_name,
+                "status": "started",
+                "gcs_uri": gcs_uri,
+                "import_type": import_type,
+                "data_schema": data_schema,
+                "datastore_id": datastore_id,
+                "message": "Document import started. Use check_import_status() to check completion."
+            }
+            
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)
+            logger.error(f"Error starting async document import ({error_type}): {error_msg}")
+            raise
+    
+    def check_import_status(self, operation_name: str) -> Dict[str, Any]:
+        """
+        Check the status of a document import operation
+        
+        Args:
+            operation_name: Full operation name from start_import_documents_async()
+        
+        Returns:
+            dict with status: "completed", "in_progress", "failed", or "unknown"
+        """
+        try:
+            from google.api_core import operations_v1
+            
+            operations_client = operations_v1.OperationsClient()
+            operation = operations_client.get_operation(name=operation_name)
+            
+            if operation.done:
+                if operation.error:
+                    return {
+                        "operation_name": operation_name,
+                        "status": "failed",
+                        "error": {
+                            "code": operation.error.code,
+                            "message": operation.error.message
+                        }
+                    }
+                else:
+                    return {
+                        "operation_name": operation_name,
+                        "status": "completed",
+                        "response": str(operation.response) if operation.response else None
+                    }
+            else:
+                return {
+                    "operation_name": operation_name,
+                    "status": "in_progress",
+                    "message": "Import operation is still running"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error checking import status: {e}")
+            return {
+                "operation_name": operation_name,
+                "status": "unknown",
+                "error": str(e)
+            }
+    
     def get_datastore_info(self, merchant_id: str) -> Optional[Dict[str, Any]]:
         """
         Get information about a datastore

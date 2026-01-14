@@ -421,6 +421,196 @@ class OnboardRequest(BaseModel):
 
 
 # Background processing function
+async def monitor_document_import_completion(
+    merchant_id: str,
+    user_id: str,
+    check_interval_seconds: int = 30,
+    max_checks: int = 120,  # 60 minutes max (120 * 30 seconds)
+    initial_wait_seconds: int = 60  # Wait 60 seconds before first check (give time for imports to start)
+):
+    """
+    Background task to monitor document import completion
+    
+    Polls import operation status and marks agent_created=TRUE when all imports complete.
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier
+        check_interval_seconds: How often to check status (default: 30 seconds)
+        max_checks: Maximum number of checks before giving up (default: 120 = 60 minutes)
+        initial_wait_seconds: Wait time before first check (default: 60 seconds)
+    """
+    import time
+    from utils.db_helpers import get_connection, return_connection
+    
+    logger.info(f"Starting document import monitoring for merchant: {merchant_id}")
+    
+    # Wait initially for imports to start
+    if initial_wait_seconds > 0:
+        logger.info(f"Waiting {initial_wait_seconds} seconds for imports to start...")
+        time.sleep(initial_wait_seconds)
+    
+    checks = 0
+    while checks < max_checks:
+        try:
+            # Get status from tracker
+            status = status_tracker.get_status(merchant_id)
+            if not status:
+                logger.warning(f"No status found for merchant {merchant_id}, stopping monitoring")
+                break
+            
+            import_operations = status.get("document_import_operations", [])
+            if not import_operations:
+                # Wait a bit more if imports haven't started yet (onboarding might still be running)
+                if checks < 10:  # Wait up to 5 minutes (10 * 30 seconds) for imports to start
+                    logger.debug(f"No import operations yet for merchant {merchant_id}, waiting... (check {checks + 1})")
+                    checks += 1
+                    time.sleep(check_interval_seconds)
+                    continue
+                else:
+                    logger.info(f"No import operations found after waiting. Checking if agent should be marked as created.")
+                    # Check if agent is already created or if there are no documents to import
+                    from utils.db_helpers import get_merchant
+                    merchant = get_merchant(merchant_id, user_id)
+                    if merchant and merchant.get('agent_created'):
+                        logger.info(f"Agent already marked as created for merchant {merchant_id}")
+                        break
+                    # If no documents to import, mark as created
+                    _mark_agent_created(merchant_id, user_id, "No documents to import")
+                    break
+            
+            # Check status of all import operations
+            all_completed = True
+            any_failed = False
+            completed_count = 0
+            failed_count = 0
+            in_progress_count = 0
+            unknown_count = 0
+            
+            for op_info in import_operations:
+                operation_name = op_info.get("operation_name")
+                if not operation_name:
+                    unknown_count += 1
+                    all_completed = False
+                    continue
+                
+                try:
+                    import_status = vertex_setup.check_import_status(operation_name)
+                    op_status = import_status.get("status")
+                    
+                    if op_status == "completed":
+                        completed_count += 1
+                        logger.info(f"✅ Import operation completed: {op_info.get('type')} ({operation_name[:50]}...)")
+                    elif op_status == "failed":
+                        failed_count += 1
+                        any_failed = True
+                        error_info = import_status.get('error', {})
+                        error_msg = error_info.get('message', str(error_info)) if isinstance(error_info, dict) else str(error_info)
+                        logger.error(f"❌ Import operation failed: {op_info.get('type')} - {error_msg}")
+                        # Even if failed, consider it "completed" (failed is a terminal state)
+                        # We'll mark agent as created but log the failure
+                    elif op_status == "in_progress":
+                        in_progress_count += 1
+                        all_completed = False
+                        if checks % 10 == 0:  # Log every 10th check (every 5 minutes)
+                            logger.info(f"⏳ Import operation still in progress: {op_info.get('type')} (check {checks + 1})")
+                    elif op_status == "unknown":
+                        unknown_count += 1
+                        all_completed = False
+                        logger.warning(f"⚠️ Import operation status unknown: {op_info.get('type')} - {import_status.get('error', 'Unknown error')}")
+                    else:
+                        unknown_count += 1
+                        all_completed = False
+                        logger.warning(f"⚠️ Import operation status unexpected: {op_info.get('type')} - {op_status}")
+                        
+                except Exception as e:
+                    logger.error(f"Error checking import status for {operation_name}: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+                    unknown_count += 1
+                    all_completed = False
+            
+            # Update status tracker with detailed information
+            total_operations = len(import_operations)
+            if all_completed:
+                if any_failed:
+                    status["document_import_status"] = "completed_with_errors"
+                    status["document_import_message"] = f"Completed with errors: {completed_count} succeeded, {failed_count} failed"
+                    # Still mark agent as created even if some imports failed (partial success)
+                    _mark_agent_created(merchant_id, user_id, status.get("document_import_message"))
+                    logger.warning(f"⚠️ Document import completed with errors for merchant {merchant_id}. Agent marked as created.")
+                else:
+                    status["document_import_status"] = "completed"
+                    status["document_import_message"] = f"All {completed_count} imports completed successfully"
+                    _mark_agent_created(merchant_id, user_id, status.get("document_import_message"))
+                    logger.info(f"✅ Document import completed successfully for merchant {merchant_id}. Agent marked as created.")
+                break
+            else:
+                status["document_import_status"] = "in_progress"
+                status["document_import_message"] = (
+                    f"In progress: {completed_count} completed, {in_progress_count} running, "
+                    f"{failed_count} failed, {unknown_count} unknown"
+                )
+                if checks % 10 == 0:  # Log progress every 10 checks
+                    logger.info(f"📊 Import progress for {merchant_id}: {status['document_import_message']}")
+            
+            checks += 1
+            if checks < max_checks:
+                time.sleep(check_interval_seconds)
+            else:
+                logger.warning(f"⏱️ Max checks reached for merchant {merchant_id} ({max_checks} checks = {max_checks * check_interval_seconds / 60:.1f} minutes). Import may still be in progress.")
+                status["document_import_status"] = "timeout"
+                status["document_import_message"] = f"Monitoring timeout after {max_checks * check_interval_seconds / 60:.1f} minutes - import may still be in progress. Check Vertex AI console for status."
+                # Don't mark agent as created on timeout - let user check manually
+                break
+                
+        except Exception as e:
+            logger.error(f"❌ Error monitoring document import for merchant {merchant_id}: {e}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            checks += 1
+            if checks < max_checks:
+                # Continue monitoring even after errors
+                time.sleep(check_interval_seconds)
+            else:
+                logger.error(f"Stopping monitoring after {checks} checks due to errors")
+                status = status_tracker.get_status(merchant_id)
+                if status:
+                    status["document_import_status"] = "monitoring_error"
+                    status["document_import_message"] = f"Monitoring stopped due to errors: {str(e)}"
+                break
+    
+    # Final status update
+    final_status = status_tracker.get_status(merchant_id)
+    if final_status:
+        logger.info(f"📋 Final import status for {merchant_id}: {final_status.get('document_import_status', 'unknown')}")
+
+def _mark_agent_created(merchant_id: str, user_id: str, message: str = "Document import completed"):
+    """
+    Mark agent as created in database
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier
+        message: Completion message
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE merchants SET agent_created = TRUE, updated_at = NOW() WHERE merchant_id = %s AND user_id = %s",
+            (merchant_id, user_id)
+        )
+        conn.commit()
+        cursor.close()
+        logger.info(f"Marked agent_created=TRUE for merchant {merchant_id}: {message}")
+    except Exception as e:
+        logger.error(f"Error marking agent_created: {e}")
+    finally:
+        if conn:
+            return_connection(conn)
+
 async def process_onboarding(
     merchant_id: str,
     user_id: str,
@@ -760,20 +950,26 @@ async def process_onboarding(
                 logger.info(f"✅ Documents datastore: {docs_ds.get('datastore_id')} ({docs_ds.get('status')})")
                 logger.info(f"   This datastore is used for NDJSON document imports (knowledge base, products, categories)")
 
-            # Import documents if available (check if documents.ndjson was created)
+            # Start document imports asynchronously (don't wait for completion)
+            # Store operation names for status checking
+            import_operations = []
             import_errors = []
-            import_success = []
             
             documents_ndjson_path = f"merchants/{merchant_id}/training_files/documents.ndjson"
             if gcs_handler.file_exists(documents_ndjson_path):
                 try:
                     gcs_uri = f"gs://{gcs_handler.bucket_name}/{documents_ndjson_path}"
-                    vertex_setup.import_documents(merchant_id, gcs_uri)
-                    import_success.append("documents")
+                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri)
+                    import_operations.append({
+                        "type": "documents",
+                        "operation_name": result.get("operation_name"),
+                        "gcs_uri": gcs_uri
+                    })
+                    logger.info(f"Started async document import: {result.get('operation_name')}")
                 except Exception as import_error:
                     error_msg = str(import_error)
                     import_errors.append(f"documents: {error_msg}")
-                    logger.error(f"Failed to import documents: {error_msg}")
+                    logger.error(f"Failed to start document import: {error_msg}")
 
             # Import products if available (check if products.ndjson was created)
             # Use INCREMENTAL to preserve existing documents (knowledge base)
@@ -781,12 +977,17 @@ async def process_onboarding(
             if gcs_handler.file_exists(products_ndjson_path):
                 try:
                     gcs_uri = f"gs://{gcs_handler.bucket_name}/{products_ndjson_path}"
-                    vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                    import_success.append("products")
+                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                    import_operations.append({
+                        "type": "products",
+                        "operation_name": result.get("operation_name"),
+                        "gcs_uri": gcs_uri
+                    })
+                    logger.info(f"Started async products import: {result.get('operation_name')}")
                 except Exception as import_error:
                     error_msg = str(import_error)
                     import_errors.append(f"products: {error_msg}")
-                    logger.error(f"Failed to import products: {error_msg}")
+                    logger.error(f"Failed to start products import: {error_msg}")
 
             # Import categories if available (check if categories.ndjson was created)
             # Use INCREMENTAL to preserve existing documents (knowledge base and products)
@@ -794,20 +995,35 @@ async def process_onboarding(
             if gcs_handler.file_exists(categories_ndjson_path):
                 try:
                     gcs_uri = f"gs://{gcs_handler.bucket_name}/{categories_ndjson_path}"
-                    vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                    import_success.append("categories")
+                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                    import_operations.append({
+                        "type": "categories",
+                        "operation_name": result.get("operation_name"),
+                        "gcs_uri": gcs_uri
+                    })
+                    logger.info(f"Started async categories import: {result.get('operation_name')}")
                 except Exception as import_error:
                     error_msg = str(import_error)
                     import_errors.append(f"categories: {error_msg}")
-                    logger.error(f"Failed to import categories: {error_msg}")
+                    logger.error(f"Failed to start categories import: {error_msg}")
+
+            # Store import operations in status tracker for monitoring
+            if import_operations:
+                status = status_tracker.get_status(merchant_id)
+                if status:
+                    status["document_import_operations"] = import_operations
+                    status["document_import_status"] = "in_progress"
+                    logger.info(f"Stored {len(import_operations)} import operations for monitoring")
 
             # Build status message
             message = "Vertex AI Search datastore configured"
             if shop_url:
                 message += f" with website crawling for {shop_url}"
             
-            if import_success:
-                message += f". Successfully imported: {', '.join(import_success)}"
+            if import_operations:
+                message += f". Started async import for: {', '.join([op['type'] for op in import_operations])}"
+            elif import_errors:
+                message += f". Import errors: {', '.join(import_errors)}"
             
             # Update database with Vertex setup results
             vertex_datastore_id = datastore_result.get('datastore_id', f"{merchant_id}-engine")
@@ -2293,22 +2509,9 @@ async def create_agent(
                 "message": f"Missing required fields: {', '.join(missing_fields)}"
             }
         
-        # Mark agent as created
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE merchants SET agent_created = TRUE, updated_at = NOW() WHERE merchant_id = %s",
-                (request.merchant_id,)
-            )
-            conn.commit()
-            cursor.close()
-        except Exception as e:
-            logger.warning(f"Error updating agent_created flag: {e}")
-        finally:
-            if conn:
-                return_connection(conn)
+        # NOTE: Don't mark agent_created yet - wait for document import to complete
+        # agent_created will be set to TRUE when document import completes successfully
+        # This is handled by the monitor_document_import_completion background task
         
         # Extract file paths from knowledge_base_files JSONB
         import json
@@ -2344,8 +2547,18 @@ async def create_agent(
             file_paths=file_paths_dict if file_paths_dict["knowledge"] else None
         )
         
-        # Start onboarding
-        return await start_onboarding(onboard_request, background_tasks)
+        # Start onboarding (returns immediately, processes in background)
+        result = await start_onboarding(onboard_request, background_tasks)
+        
+        # Add background task to monitor document import completion
+        # This will check import status and mark agent_created when complete
+        background_tasks.add_task(
+            monitor_document_import_completion,
+            merchant_id=request.merchant_id,
+            user_id=request.user_id
+        )
+        
+        return result
     
     except HTTPException:
         raise
@@ -2578,12 +2791,68 @@ async def get_onboarding_status(merchant_id: str):
                 }
             }
         
+        # Check document import status if operations are stored
+        document_import_info = None
+        if status and status.get("document_import_operations"):
+            import_operations = status.get("document_import_operations", [])
+            import_statuses = []
+            
+            # Only check status if vertex_setup is initialized
+            if vertex_setup:
+                for op_info in import_operations:
+                    operation_name = op_info.get("operation_name")
+                    if operation_name:
+                        try:
+                            op_status = vertex_setup.check_import_status(operation_name)
+                            import_statuses.append({
+                                "type": op_info.get("type"),
+                                "operation_name": operation_name,
+                                "status": op_status.get("status"),
+                                "error": op_status.get("error") if op_status.get("status") == "failed" else None,
+                                "message": op_status.get("message")
+                            })
+                        except Exception as e:
+                            logger.warning(f"Error checking import status for {operation_name}: {e}")
+                            import_statuses.append({
+                                "type": op_info.get("type"),
+                                "operation_name": operation_name,
+                                "status": "unknown",
+                                "error": str(e)
+                            })
+                    else:
+                        import_statuses.append({
+                            "type": op_info.get("type"),
+                            "operation_name": None,
+                            "status": "unknown",
+                            "error": "Operation name not available"
+                        })
+            else:
+                # If vertex_setup not initialized, just return stored status
+                logger.warning("VertexSetup not initialized, cannot check import status")
+                for op_info in import_operations:
+                    import_statuses.append({
+                        "type": op_info.get("type"),
+                        "operation_name": op_info.get("operation_name"),
+                        "status": "unknown",
+                        "error": "VertexSetup not initialized"
+                    })
+            
+            document_import_info = {
+                "status": status.get("document_import_status", "unknown"),
+                "message": status.get("document_import_message", ""),
+                "operations": import_statuses,
+                "agent_created": merchant_db.get("agent_created", False) if merchant_db else False,
+                "total_operations": len(import_operations)
+            }
+        
         # Merge status with database information
         if status:
             status["database_steps"] = db_steps_completed
             status["onboarding_status"] = merchant_db.get("onboarding_status") if merchant_db else None
             status["last_error"] = merchant_db.get("last_error") if merchant_db else None
             status["last_onboarding_at"] = merchant_db.get("last_onboarding_at") if merchant_db else None
+            if document_import_info:
+                status["document_import"] = document_import_info
         else:
             # If no in-memory status, return database status only
             status = {
@@ -2595,6 +2864,8 @@ async def get_onboarding_status(merchant_id: str):
                 "last_onboarding_at": merchant_db.get("last_onboarding_at") if merchant_db else None,
                 "message": "No active job found, showing database status only"
             }
+            if document_import_info:
+                status["document_import"] = document_import_info
 
         return status
 
