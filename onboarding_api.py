@@ -1857,6 +1857,43 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             logger.warning(f"Failed to create folder structure for merchant {merchant_id}: {folder_error}")
             logger.info("Folders will be created during onboarding if needed")
         
+        # Update merchant config file immediately with AI persona data
+        # This ensures config is always in sync with database
+        config_updated = False
+        if config_generator:
+            try:
+                # Get merchant data from database to ensure we have all fields (including defaults)
+                merchant_data = get_merchant(merchant_id, request.user_id)
+                
+                if merchant_data:
+                    # Generate/update config with AI persona data
+                    # Use data from database (which we just updated) to ensure consistency
+                    config_result = config_generator.generate_config(
+                        user_id=request.user_id,
+                        merchant_id=merchant_id,
+                        shop_name=merchant_data.get('shop_name') or request.store_name,
+                        shop_url=merchant_data.get('shop_url') or request.shop_url,
+                        bot_name=merchant_data.get('bot_name') or request.agent_name,
+                        bot_tone=merchant_data.get('bot_tone') or request.tone_of_voice,
+                        customer_persona=merchant_data.get('customer_persona') or request.customer_persona,
+                        prompt_text=merchant_data.get('prompt_text') or request.system_prompt,
+                        top_questions=merchant_data.get('top_questions') or top_questions_str,
+                        top_products=merchant_data.get('top_products') or top_products_str,
+                        primary_color=merchant_data.get('primary_color', "#667eea"),
+                        secondary_color=merchant_data.get('secondary_color', "#764ba2"),
+                        logo_url=merchant_data.get('logo_url')
+                    )
+                    config_updated = True
+                    logger.info(f"✅ Updated merchant_config.json for merchant: {merchant_id}")
+                else:
+                    logger.warning(f"Could not retrieve merchant data to update config for: {merchant_id}")
+            except Exception as config_error:
+                # Log error but don't fail the request - config will be generated during onboarding
+                logger.warning(f"Failed to update merchant config for {merchant_id}: {config_error}")
+                logger.info("Config will be generated during onboarding if needed")
+        else:
+            logger.warning("config_generator not initialized, skipping config update")
+        
         logger.info(f"AI Persona saved for merchant: {merchant_id}")
         
         return {
@@ -1864,7 +1901,8 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             "status": "saved",
             "ai_persona_saved": True,
             "folders_created": True,
-            "message": "AI Persona saved successfully. Folder structure created. Proceed to Knowledge Base step."
+            "config_updated": config_updated,
+            "message": "AI Persona saved successfully. Folder structure created. Config file updated. Proceed to Knowledge Base step."
         }
     
     except HTTPException:
@@ -2799,9 +2837,22 @@ async def get_onboarding_status(merchant_id: str):
             }
         
         # Check document import status if operations are stored (on-demand check)
-        # Also check if there were import errors
+        # Only show document_import if agent creation has started (Step 3)
+        # Document import only happens during Step 3 (Create Agent), not during Step 1 (AI Persona)
         document_import_info = None
-        if status and (status.get("document_import_operations") or status.get("document_import_errors")):
+        # Only show document_import if:
+        # 1. Status has document_import_operations or errors (import was attempted)
+        # 2. AND agent creation has started (onboarding has begun, not just AI persona saved)
+        has_started_onboarding = (
+            merchant_db and (
+                merchant_db.get("step_vertex_setup") or  # Vertex setup means onboarding started
+                merchant_db.get("step_documents_converted") or  # Documents converted means onboarding started
+                merchant_db.get("step_onboarding_completed") or  # Onboarding completed
+                status and status.get("steps", {}).get("setup_vertex")  # Or in-memory status shows vertex setup
+            )
+        )
+        
+        if status and (status.get("document_import_operations") or status.get("document_import_errors")) and has_started_onboarding:
             import_operations = status.get("document_import_operations", [])
             import_errors = status.get("document_import_errors", [])
             import_statuses = []

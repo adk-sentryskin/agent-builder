@@ -1139,7 +1139,7 @@ class VertexSetup:
                     "metadata": metadata,
                     "message": "Import operation is still running",
                 }
-                } 
+            
 
             # done=True
             if operation.HasField("error"):
