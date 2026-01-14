@@ -374,6 +374,11 @@ def check_subscription(user_id: str) -> bool:
     Returns:
         True if user has active subscription or is a production user
     """
+    # Development bypass: Skip subscription check if SKIP_SUBSCRIPTION_CHECK is set
+    if os.getenv("SKIP_SUBSCRIPTION_CHECK", "").lower() in ("true", "1", "yes"):
+        logger.info(f"SKIP_SUBSCRIPTION_CHECK enabled - bypassing subscription check for user {user_id}")
+        return True
+    
     conn = None
     try:
         conn = get_connection()
@@ -402,7 +407,7 @@ def check_subscription(user_id: str) -> bool:
         
         # Check user_subscriptions in billing schema
         query = """
-            SELECT subscription_id 
+            SELECT subscription_id, status, current_period_end
             FROM billing.user_subscriptions
             WHERE user_id = %s 
                 AND status = 'active'
@@ -412,9 +417,31 @@ def check_subscription(user_id: str) -> bool:
         
         cursor.execute(query, (user_id,))
         result = cursor.fetchone()
-        cursor.close()
         
-        return result is not None
+        if result:
+            logger.info(f"User {user_id} has active subscription: {result.get('subscription_id')}")
+            cursor.close()
+            return True
+        else:
+            # Check if subscription exists but is inactive/expired
+            debug_query = """
+                SELECT subscription_id, status, current_period_end
+                FROM billing.user_subscriptions
+                WHERE user_id = %s
+                LIMIT 1
+            """
+            cursor.execute(debug_query, (user_id,))
+            debug_result = cursor.fetchone()
+            if debug_result:
+                logger.warning(
+                    f"User {user_id} has subscription but not active: "
+                    f"status={debug_result.get('status')}, "
+                    f"current_period_end={debug_result.get('current_period_end')}"
+                )
+            else:
+                logger.warning(f"User {user_id} has no subscription record in billing.user_subscriptions")
+            cursor.close()
+            return False
         
     except Exception as e:
         logger.error(f"Error checking subscription: {e}")

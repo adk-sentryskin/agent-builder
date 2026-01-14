@@ -1008,12 +1008,19 @@ async def process_onboarding(
                     logger.error(f"Failed to start categories import: {error_msg}")
 
             # Store import operations in status tracker for monitoring
-            if import_operations:
-                status = status_tracker.get_status(merchant_id)
-                if status:
+            # Also store import errors so status endpoint can show them
+            status = status_tracker.get_status(merchant_id)
+            if status:
+                if import_operations:
                     status["document_import_operations"] = import_operations
                     status["document_import_status"] = "in_progress"
                     logger.info(f"Stored {len(import_operations)} import operations for monitoring")
+                elif import_errors:
+                    # Store errors even if no operations started (e.g., conflict errors)
+                    status["document_import_errors"] = import_errors
+                    status["document_import_status"] = "error"
+                    status["document_import_message"] = f"Failed to start imports: {', '.join(import_errors)}"
+                    logger.warning(f"Document import failed to start: {', '.join(import_errors)}")
 
             # Build status message
             message = "Vertex AI Search datastore configured"
@@ -2548,15 +2555,14 @@ async def create_agent(
         )
         
         # Start onboarding (returns immediately, processes in background)
+        logger.info(f"🚀 Starting async onboarding for merchant {request.merchant_id} - should return immediately")
+        start_time = datetime.utcnow()
         result = await start_onboarding(onboard_request, background_tasks)
+        elapsed = (datetime.utcnow() - start_time).total_seconds()
+        logger.info(f"✅ start_onboarding returned in {elapsed:.2f} seconds for merchant {request.merchant_id}")
         
-        # Add background task to monitor document import completion
-        # This will check import status and mark agent_created when complete
-        background_tasks.add_task(
-            monitor_document_import_completion,
-            merchant_id=request.merchant_id,
-            user_id=request.user_id
-        )
+        # NOTE: Document import status will be checked on-demand when user calls /onboard-status
+        # This avoids continuous background polling and marks agent_created when imports complete
         
         return result
     
@@ -2693,7 +2699,8 @@ async def start_onboarding(
         # Create job in status tracker
         job_id = status_tracker.create_job(request.merchant_id, request.user_id)
 
-        # Start background processing
+        # Start background processing (non-blocking)
+        logger.info(f"📋 Adding process_onboarding background task for merchant {request.merchant_id}")
         background_tasks.add_task(
             process_onboarding,
             merchant_id=request.merchant_id,
@@ -2715,7 +2722,7 @@ async def start_onboarding(
             file_paths=request.file_paths
         )
 
-        logger.info(f"Started onboarding job {job_id} for merchant {request.merchant_id}")
+        logger.info(f"✅ Started onboarding job {job_id} for merchant {request.merchant_id} - returning immediately")
 
         return {
             "job_id": job_id,
@@ -2791,26 +2798,74 @@ async def get_onboarding_status(merchant_id: str):
                 }
             }
         
-        # Check document import status if operations are stored
+        # Check document import status if operations are stored (on-demand check)
+        # Also check if there were import errors
         document_import_info = None
-        if status and status.get("document_import_operations"):
+        if status and (status.get("document_import_operations") or status.get("document_import_errors")):
             import_operations = status.get("document_import_operations", [])
+            import_errors = status.get("document_import_errors", [])
             import_statuses = []
             
-            # Only check status if vertex_setup is initialized
-            if vertex_setup:
-                for op_info in import_operations:
-                    operation_name = op_info.get("operation_name")
+            # Track completion status
+            all_completed = True
+            any_failed = False
+            completed_count = 0
+            failed_count = 0
+            in_progress_count = 0
+            unknown_count = 0
+            
+            # If there are errors but no operations, show error status
+            if import_errors and not import_operations:
+                document_import_info = {
+                    "status": status.get("document_import_status", "error"),
+                    "message": status.get("document_import_message", f"Failed to start imports: {', '.join(import_errors)}"),
+                    "operations": [],
+                    "errors": import_errors,
+                    "agent_created": merchant_db.get("agent_created", False) if merchant_db else False,
+                    "total_operations": 0
+                }
+            # Only check status if vertex_setup is initialized and we have operations
+            elif import_operations:
+                if not vertex_setup:
+                    # If vertex_setup not initialized, just return stored status
+                    logger.warning("VertexSetup not initialized, cannot check import status")
+                    for op_info in import_operations:
+                        import_statuses.append({
+                            "type": op_info.get("type"),
+                            "operation_name": op_info.get("operation_name"),
+                            "status": "unknown",
+                            "error": "VertexSetup not initialized"
+                        })
+                    all_completed = False
+                else:
+                    for op_info in import_operations:
+                        operation_name = op_info.get("operation_name")
                     if operation_name:
                         try:
                             op_status = vertex_setup.check_import_status(operation_name)
+                            op_status_value = op_status.get("status")
+                            
                             import_statuses.append({
                                 "type": op_info.get("type"),
                                 "operation_name": operation_name,
-                                "status": op_status.get("status"),
-                                "error": op_status.get("error") if op_status.get("status") == "failed" else None,
+                                "status": op_status_value,
+                                "error": op_status.get("error") if op_status_value == "failed" else None,
                                 "message": op_status.get("message")
                             })
+                            
+                            # Track completion
+                            if op_status_value == "completed":
+                                completed_count += 1
+                            elif op_status_value == "failed":
+                                failed_count += 1
+                                any_failed = True
+                            elif op_status_value == "in_progress":
+                                in_progress_count += 1
+                                all_completed = False
+                            else:
+                                unknown_count += 1
+                                all_completed = False
+                                
                         except Exception as e:
                             logger.warning(f"Error checking import status for {operation_name}: {e}")
                             import_statuses.append({
@@ -2819,6 +2874,8 @@ async def get_onboarding_status(merchant_id: str):
                                 "status": "unknown",
                                 "error": str(e)
                             })
+                            unknown_count += 1
+                            all_completed = False
                     else:
                         import_statuses.append({
                             "type": op_info.get("type"),
@@ -2826,24 +2883,50 @@ async def get_onboarding_status(merchant_id: str):
                             "status": "unknown",
                             "error": "Operation name not available"
                         })
-            else:
-                # If vertex_setup not initialized, just return stored status
-                logger.warning("VertexSetup not initialized, cannot check import status")
-                for op_info in import_operations:
-                    import_statuses.append({
-                        "type": op_info.get("type"),
-                        "operation_name": op_info.get("operation_name"),
-                        "status": "unknown",
-                        "error": "VertexSetup not initialized"
-                    })
-            
-            document_import_info = {
-                "status": status.get("document_import_status", "unknown"),
-                "message": status.get("document_import_message", ""),
-                "operations": import_statuses,
-                "agent_created": merchant_db.get("agent_created", False) if merchant_db else False,
-                "total_operations": len(import_operations)
-            }
+                        unknown_count += 1
+                        all_completed = False
+                
+                # Update status based on current check (only if we have operations)
+                # Check if all operations are actually completed (no running operations)
+                total_ops = len(import_operations)
+                all_ops_completed = (completed_count + failed_count + unknown_count) == total_ops and in_progress_count == 0
+                
+                if all_ops_completed or all_completed:
+                    if any_failed or failed_count > 0:
+                        status["document_import_status"] = "completed_with_errors"
+                        status["document_import_message"] = f"Completed with errors: {completed_count} succeeded, {failed_count} failed"
+                    else:
+                        status["document_import_status"] = "completed"
+                        status["document_import_message"] = f"All {completed_count} imports completed successfully"
+                    
+                    # Mark agent as created if not already marked
+                    if merchant_db and not merchant_db.get("agent_created"):
+                        user_id = merchant_db.get("user_id")
+                        if user_id:
+                            _mark_agent_created(merchant_id, user_id, status.get("document_import_message", "Document import completed"))
+                            # Refresh merchant_db to get updated agent_created status
+                            merchant_db = get_merchant(merchant_id, user_id=None)
+                            logger.info(f"✅ Marked agent_created=TRUE for merchant {merchant_id} (checked on-demand)")
+                        else:
+                            logger.warning(f"Cannot mark agent_created: user_id not found for merchant {merchant_id}")
+                else:
+                    status["document_import_status"] = "in_progress"
+                    status["document_import_message"] = (
+                        f"In progress: {completed_count} completed, {in_progress_count} running, "
+                        f"{failed_count} failed, {unknown_count} unknown"
+                    )
+                
+                # Build document_import_info only if we processed operations
+                if not document_import_info:
+                    document_import_info = {
+                        "status": status.get("document_import_status", "unknown"),
+                        "message": status.get("document_import_message", ""),
+                        "operations": import_statuses,
+                        "agent_created": merchant_db.get("agent_created", False) if merchant_db else False,
+                        "total_operations": len(import_operations)
+                    }
+                    if import_errors:
+                        document_import_info["errors"] = import_errors
         
         # Merge status with database information
         if status:

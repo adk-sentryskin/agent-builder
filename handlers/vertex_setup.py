@@ -1093,49 +1093,85 @@ class VertexSetup:
     
     def check_import_status(self, operation_name: str) -> Dict[str, Any]:
         """
-        Check the status of a document import operation
-        
-        Args:
-            operation_name: Full operation name from start_import_documents_async()
-        
-        Returns:
-            dict with status: "completed", "in_progress", "failed", or "unknown"
+        Check the status of a document import operation.
+        Returns status: completed | in_progress | failed | unknown
         """
         try:
             from google.api_core import operations_v1
             
-            operations_client = operations_v1.OperationsClient()
+            # Prefer public transport attribute, fall back to private
+            transport = getattr(self.client, "transport", None) or getattr(self.client, "_transport", None)
+            if transport is None:
+                raise RuntimeError("Client has no transport; cannot create operations client.")
+
+            # Prefer embedded operations client if provided by transport
+            operations_client = getattr(transport, "operations_client", None) or getattr(transport, "_operations_client", None)
+
+            # Otherwise create OperationsClient from gRPC channel (gRPC transport only)
+            if operations_client is None:
+                channel = getattr(transport, "grpc_channel", None) or getattr(transport, "_grpc_channel", None)
+                if channel is None and hasattr(transport, "get_channel"):
+                    channel = transport.get_channel()
+                if channel is None and hasattr(transport, "get_grpc_channel"):
+                    channel = transport.get_grpc_channel()
+
+                if channel is None:
+                    raise RuntimeError(
+                        f"Cannot create OperationsClient: no gRPC channel found on transport (type={type(transport)}). "
+                        "If you're using REST transport, use the transport's operations_client (if available) "
+                        "or switch to gRPC transport."
+                    )
+
+                # IMPORTANT: pass channel positionally
+                operations_client = operations_v1.OperationsClient(channel)
+
             operation = operations_client.get_operation(name=operation_name)
-            
-            if operation.done:
-                if operation.error:
-                    return {
-                        "operation_name": operation_name,
-                        "status": "failed",
-                        "error": {
-                            "code": operation.error.code,
-                            "message": operation.error.message
-                        }
-                    }
-                else:
-                    return {
-                        "operation_name": operation_name,
-                        "status": "completed",
-                        "response": str(operation.response) if operation.response else None
-                    }
-            else:
+
+            # Metadata is useful even when not done
+            metadata = None
+            if getattr(operation, "metadata", None):
+                metadata = str(operation.metadata)
+
+            if not operation.done:
                 return {
                     "operation_name": operation_name,
                     "status": "in_progress",
-                    "message": "Import operation is still running"
+                    "metadata": metadata,
+                    "message": "Import operation is still running",
                 }
-                
+                } 
+
+            # done=True
+            if operation.HasField("error"):
+                return {
+                    "operation_name": operation_name,
+                    "status": "failed",
+                    "metadata": metadata,
+                    "error": {
+                        "code": operation.error.code,
+                        "message": operation.error.message,
+                    },
+                }
+
+            # completed
+            response = None
+            if getattr(operation, "response", None):
+                # Usually google.protobuf.any_pb2.Any, so string may be ugly, but safe.
+                response = str(operation.response)
+
+            return {
+                "operation_name": operation_name,
+                "status": "completed",
+                "metadata": metadata,
+                "response": response,
+            }
+
         except Exception as e:
-            logger.error(f"Error checking import status: {e}")
+            logger.exception("Error checking import status")
             return {
                 "operation_name": operation_name,
                 "status": "unknown",
-                "error": str(e)
+                "error": str(e),
             }
     
     def get_datastore_info(self, merchant_id: str) -> Optional[Dict[str, Any]]:
