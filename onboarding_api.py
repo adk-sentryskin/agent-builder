@@ -1254,15 +1254,26 @@ async def process_agent_update(
                         message=f"Re-processed {result.get('product_count', 0)} products"
                     )
                     
-                    # Re-import products to Vertex AI (INCREMENTAL mode)
+                    # Re-import products to Vertex AI (INCREMENTAL mode) - async
                     products_ndjson_path = f"merchants/{merchant_id}/training_files/products.ndjson"
                     if gcs_handler.file_exists(products_ndjson_path):
                         try:
                             gcs_uri = f"gs://{gcs_handler.bucket_name}/{products_ndjson_path}"
-                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Re-imported products to Vertex AI for merchant: {merchant_id}")
+                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Started async re-import of products to Vertex AI: {result.get('operation_name')}")
+                            # Store operation for status tracking
+                            status = status_tracker.get_status(merchant_id)
+                            if status:
+                                if "document_import_operations" not in status:
+                                    status["document_import_operations"] = []
+                                status["document_import_operations"].append({
+                                    "type": "products",
+                                    "operation_name": result.get("operation_name"),
+                                    "gcs_uri": gcs_uri
+                                })
+                                status["document_import_status"] = "in_progress"
                         except Exception as e:
-                            logger.error(f"Failed to re-import products to Vertex AI: {e}")
+                            logger.error(f"Failed to start async re-import of products to Vertex AI: {e}")
                             # Log error but continue - Vertex AI import failures don't stop the update
                 except Exception as e:
                     logger.error(f"Error re-processing products: {e}")
@@ -1314,15 +1325,26 @@ async def process_agent_update(
                         message=f"Re-processed {result.get('category_count', 0)} categories"
                     )
                     
-                    # Re-import categories to Vertex AI (INCREMENTAL mode)
+                    # Re-import categories to Vertex AI (INCREMENTAL mode) - async
                     categories_ndjson_path = f"merchants/{merchant_id}/training_files/categories.ndjson"
                     if gcs_handler.file_exists(categories_ndjson_path):
                         try:
                             gcs_uri = f"gs://{gcs_handler.bucket_name}/{categories_ndjson_path}"
-                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Re-imported categories to Vertex AI for merchant: {merchant_id}")
+                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Started async re-import of categories to Vertex AI: {result.get('operation_name')}")
+                            # Store operation for status tracking
+                            status = status_tracker.get_status(merchant_id)
+                            if status:
+                                if "document_import_operations" not in status:
+                                    status["document_import_operations"] = []
+                                status["document_import_operations"].append({
+                                    "type": "categories",
+                                    "operation_name": result.get("operation_name"),
+                                    "gcs_uri": gcs_uri
+                                })
+                                status["document_import_status"] = "in_progress"
                         except Exception as e:
-                            logger.error(f"Failed to re-import categories to Vertex AI: {e}")
+                            logger.error(f"Failed to start async re-import of categories to Vertex AI: {e}")
                             # Log error but continue - Vertex AI import failures don't stop the update
                 except Exception as e:
                     logger.error(f"Error re-processing categories: {e}")
@@ -1375,20 +1397,28 @@ async def process_agent_update(
                         message=f"Re-converted {result.get('document_count', 0)} documents"
                     )
                     
-                    # Re-import documents to Vertex AI (INCREMENTAL mode - adds/updates only)
+                    # Re-import documents to Vertex AI (INCREMENTAL mode - adds/updates only) - async
                     documents_ndjson_path = f"merchants/{merchant_id}/training_files/documents.ndjson"
                     if gcs_handler.file_exists(documents_ndjson_path):
                         try:
                             gcs_uri = f"gs://{gcs_handler.bucket_name}/{documents_ndjson_path}"
-                            vertex_setup.import_documents(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Re-imported documents to Vertex AI for merchant: {merchant_id}")
-                            # Update job status to indicate Vertex AI update completed
+                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
+                            logger.info(f"Started async re-import of documents to Vertex AI: {result.get('operation_name')}")
+                            # Store operation for status tracking
                             status = status_tracker.get_status(merchant_id)
                             if status:
-                                status["message"] = "Documents re-imported to Vertex AI successfully"
+                                if "document_import_operations" not in status:
+                                    status["document_import_operations"] = []
+                                status["document_import_operations"].append({
+                                    "type": "documents",
+                                    "operation_name": result.get("operation_name"),
+                                    "gcs_uri": gcs_uri
+                                })
+                                status["document_import_status"] = "in_progress"
+                                status["message"] = "Documents re-converted. Import to Vertex AI started (async)."
                                 status["updated_at"] = datetime.utcnow().isoformat()
                         except Exception as e:
-                            logger.error(f"Failed to re-import documents to Vertex AI: {e}")
+                            logger.error(f"Failed to start async re-import of documents to Vertex AI: {e}")
                             # Log error but continue - Vertex AI import failures don't stop the update
                             # Update job status to indicate partial failure
                             status = status_tracker.get_status(merchant_id)
