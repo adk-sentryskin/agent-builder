@@ -421,15 +421,26 @@ class GCSHandler:
             logger.info(f"Deleted file: {object_path}")
             
             return {
+                "success": True,
                 "status": "deleted",
                 "object_path": object_path,
                 "message": "File deleted successfully"
             }
         except FileNotFoundError:
-            raise
+            return {
+                "success": False,
+                "status": "not_found",
+                "object_path": object_path,
+                "error": f"File not found: {object_path}"
+            }
         except Exception as e:
             logger.error(f"Error deleting file: {e}")
-            raise
+            return {
+                "success": False,
+                "status": "error",
+                "object_path": object_path,
+                "error": str(e)
+            }
 
     def confirm_upload(self, object_path: str) -> dict:
         """

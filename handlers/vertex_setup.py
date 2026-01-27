@@ -1174,6 +1174,81 @@ class VertexSetup:
                 "error": str(e),
             }
     
+    def delete_datastore(self, datastore_id: str) -> Dict[str, Any]:
+        """
+        Delete a Vertex AI Search datastore
+        
+        Args:
+            datastore_id: Datastore ID (e.g., "my-store-docs-engine")
+        
+        Returns:
+            dict with success status and message
+        """
+        try:
+            parent = f"projects/{self.project_id}/locations/{self.location}/collections/{self.collection_id}"
+            datastore_path = f"{parent}/dataStores/{datastore_id}"
+            
+            # Verify datastore_client is initialized
+            if not self.datastore_client:
+                raise RuntimeError("DataStoreServiceClient not initialized")
+            
+            # Use datastore_client to delete
+            # Note: delete_data_store returns an operation that needs to be waited on
+            operation = self.datastore_client.delete_data_store(name=datastore_path)
+            
+            # Wait for operation to complete (delete is usually fast, but can take time)
+            # Use a reasonable timeout - datastore deletion can take a few minutes
+            try:
+                operation.result(timeout=300)  # 5 minute timeout
+                logger.info(f"Successfully deleted datastore: {datastore_id}")
+                return {
+                    "success": True,
+                    "datastore_id": datastore_id,
+                    "message": f"Datastore {datastore_id} deleted successfully"
+                }
+            except Exception as op_error:
+                # Check if operation completed but we just timed out waiting
+                if operation.done():
+                    logger.info(f"Datastore {datastore_id} deletion completed (operation done)")
+                    return {
+                        "success": True,
+                        "datastore_id": datastore_id,
+                        "message": f"Datastore {datastore_id} deletion completed"
+                    }
+                else:
+                    # Operation still running - log warning but return success
+                    # The deletion will continue in background
+                    logger.warning(f"Datastore {datastore_id} deletion operation still running after timeout")
+                    return {
+                        "success": True,
+                        "datastore_id": datastore_id,
+                        "message": f"Datastore {datastore_id} deletion started (may complete in background)",
+                        "warning": "Deletion operation timed out but is still running"
+                    }
+        except gcp_exceptions.NotFound:
+            logger.warning(f"Datastore {datastore_id} not found (may already be deleted)")
+            return {
+                "success": True,
+                "datastore_id": datastore_id,
+                "message": f"Datastore {datastore_id} not found (already deleted or never existed)"
+            }
+        except gcp_exceptions.PermissionDenied as e:
+            logger.error(f"Permission denied deleting datastore {datastore_id}: {e}")
+            return {
+                "success": False,
+                "datastore_id": datastore_id,
+                "error": f"Permission denied: {str(e)}"
+            }
+        except Exception as e:
+            logger.error(f"Error deleting datastore {datastore_id}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return {
+                "success": False,
+                "datastore_id": datastore_id,
+                "error": str(e)
+            }
+    
     def get_datastore_info(self, merchant_id: str) -> Optional[Dict[str, Any]]:
         """
         Get information about a datastore

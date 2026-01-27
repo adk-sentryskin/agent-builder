@@ -782,7 +782,16 @@ def update_merchant(
 
 def delete_merchant(merchant_id: str, user_id: str) -> bool:
     """
-    Delete merchant and all associated data
+    Delete merchant and all associated data from database
+    
+    This function deletes:
+    1. Merchant record from merchants table
+    2. All related records via CASCADE:
+       - onboarding_jobs (ON DELETE CASCADE)
+       - vertex_datastores (ON DELETE CASCADE)
+    3. Any other tables with foreign keys to merchants (if they exist)
+    
+    Note: CASCADE deletes are handled automatically by PostgreSQL foreign key constraints.
     
     Args:
         merchant_id: Merchant identifier
@@ -801,7 +810,51 @@ def delete_merchant(merchant_id: str, user_id: str) -> bool:
         conn = get_connection()
         cursor = conn.cursor()
         
-        # Delete merchant (cascade will handle related records)
+        # Explicitly delete related records first (for logging and clarity)
+        # Note: CASCADE will handle these automatically, but we log them for transparency
+        
+        # Count related records before deletion (for logging)
+        deleted_counts = {}
+        try:
+            cursor.execute("SELECT COUNT(*) FROM onboarding_jobs WHERE merchant_id = %s", (merchant_id,))
+            deleted_counts['onboarding_jobs'] = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM vertex_datastores WHERE merchant_id = %s", (merchant_id,))
+            deleted_counts['vertex_datastores'] = cursor.fetchone()[0]
+            
+            # Check for shopify_stores table (may not exist in all databases)
+            try:
+                cursor.execute("""
+                    SELECT COUNT(*) FROM shopify_sync.shopify_stores 
+                    WHERE merchant_id = %s
+                """, (merchant_id,))
+                deleted_counts['shopify_stores'] = cursor.fetchone()[0]
+            except Exception:
+                # Table or schema may not exist, skip
+                pass
+            
+            logger.info(f"Deleting merchant {merchant_id}: Related records to be cascade deleted: {deleted_counts}")
+        except Exception as e:
+            logger.warning(f"Could not count related records (may not exist): {e}")
+        
+        # Delete from shopify_stores if it exists (may not have CASCADE constraint)
+        try:
+            cursor.execute("""
+                DELETE FROM shopify_sync.shopify_stores 
+                WHERE merchant_id = %s
+            """, (merchant_id,))
+            shopify_deleted = cursor.rowcount
+            if shopify_deleted > 0:
+                logger.info(f"Deleted {shopify_deleted} record(s) from shopify_sync.shopify_stores")
+        except Exception as e:
+            # Table or schema may not exist, or may have CASCADE - that's fine
+            logger.debug(f"Could not delete from shopify_stores (may not exist or have CASCADE): {e}")
+        
+        # Delete merchant (CASCADE will automatically delete related records)
+        # Tables with ON DELETE CASCADE:
+        # - onboarding_jobs (FOREIGN KEY merchant_id)
+        # - vertex_datastores (FOREIGN KEY merchant_id)
+        # Note: shopify_sync.shopify_stores is deleted above (may not have CASCADE)
         query = """
             DELETE FROM merchants
             WHERE merchant_id = %s AND user_id = %s
@@ -813,7 +866,7 @@ def delete_merchant(merchant_id: str, user_id: str) -> bool:
         cursor.close()
         
         if rows_deleted > 0:
-            logger.info(f"Deleted merchant {merchant_id} for user {user_id}")
+            logger.info(f"✅ Deleted merchant {merchant_id} for user {user_id} (and all related records via CASCADE)")
             return True
         else:
             logger.warning(f"Merchant {merchant_id} not found or not owned by user {user_id}")

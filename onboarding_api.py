@@ -355,6 +355,19 @@ class UpdateAgentRequest(BaseModel):
     update_categories: bool = Field(False, description="Re-process categories file if it exists")
 
 
+class DeleteAgentRequest(BaseModel):
+    """Delete Agent - Remove agent and all associated data
+    
+    This will ALWAYS delete everything:
+    - Vertex AI datastores (website and docs engines)
+    - GCS files (entire merchant folder)
+    - Database records (merchant and all related data)
+    - Status tracking data
+    """
+    merchant_id: str
+    user_id: str
+
+
 class SaveCustomChatbotRequest(BaseModel):
     """Save Custom Chatbot Configuration - Chatbot UI customization (Step 4)"""
     merchant_id: str = Field(..., description="Merchant identifier")
@@ -2228,9 +2241,12 @@ async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
         gcs_deleted = False
         if request.delete_from_storage:
             try:
-                gcs_handler.delete_file(request.file_path)
-                gcs_deleted = True
-            except FileNotFoundError:
+                result = gcs_handler.delete_file(request.file_path)
+                if result.get("success"):
+                    gcs_deleted = True
+                else:
+                    logger.warning(f"Failed to delete file from GCS: {result.get('error')}")
+            except Exception as e:
                 logger.warning(f"File not found in GCS (may have been deleted already): {request.file_path}")
             except Exception as e:
                 logger.warning(f"Error deleting file from GCS: {e}. Continuing with metadata removal.")
@@ -2741,6 +2757,169 @@ async def update_agent(
         raise
     except Exception as e:
         logger.error(f"Error starting agent update: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_agent_deletion(
+    merchant_id: str,
+    user_id: str
+):
+    """
+    Background task for deleting agent and all associated data
+    
+    This ALWAYS deletes everything (unconditional deletion):
+    1. Vertex AI datastores (website and docs datastores)
+    2. GCS files (entire merchant folder)
+    3. Database record (merchant and all related data via CASCADE)
+    4. Status tracking data
+    """
+    try:
+        logger.info(f"Starting complete agent deletion for merchant {merchant_id}")
+        
+        # Step 1: Delete Vertex AI datastores (ALWAYS)
+        if vertex_setup:
+            try:
+                # Delete website datastore
+                website_datastore_id = f"{merchant_id}-website-engine"
+                logger.info(f"Deleting website datastore: {website_datastore_id}")
+                result = vertex_setup.delete_datastore(website_datastore_id)
+                if result.get("success"):
+                    logger.info(f"✓ Deleted website datastore: {result.get('message')}")
+                    if result.get("warning"):
+                        logger.warning(f"Website datastore deletion: {result.get('warning')}")
+                else:
+                    logger.warning(f"Failed to delete website datastore: {result.get('error')}")
+                    # Continue with other deletions even if this fails
+                
+                # Delete documents datastore
+                docs_datastore_id = f"{merchant_id}-docs-engine"
+                logger.info(f"Deleting documents datastore: {docs_datastore_id}")
+                result = vertex_setup.delete_datastore(docs_datastore_id)
+                if result.get("success"):
+                    logger.info(f"✓ Deleted documents datastore: {result.get('message')}")
+                    if result.get("warning"):
+                        logger.warning(f"Documents datastore deletion: {result.get('warning')}")
+                else:
+                    logger.warning(f"Failed to delete documents datastore: {result.get('error')}")
+                    # Continue with other deletions even if this fails
+            except Exception as e:
+                logger.error(f"Error deleting Vertex AI datastores: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                # Continue with other cleanup even if datastore deletion fails
+        
+        # Step 2: Delete GCS files (entire merchant folder) - ALWAYS
+        if gcs_handler:
+            try:
+                merchant_prefix = f"merchants/{merchant_id}/"
+                logger.info(f"Deleting GCS files with prefix: {merchant_prefix}")
+                
+                # List all files in merchant folder
+                files_to_delete = gcs_handler.list_files(merchant_prefix)
+                
+                if not files_to_delete:
+                    logger.info(f"No files found in GCS for merchant {merchant_id} (prefix: {merchant_prefix})")
+                else:
+                    logger.info(f"Found {len(files_to_delete)} files to delete for merchant {merchant_id}")
+                    deleted_count = 0
+                    failed_count = 0
+                    
+                    for file_path in files_to_delete:
+                        try:
+                            result = gcs_handler.delete_file(file_path)
+                            if result.get("success"):
+                                deleted_count += 1
+                            else:
+                                failed_count += 1
+                                logger.warning(f"Failed to delete file {file_path}: {result.get('error')}")
+                        except Exception as e:
+                            failed_count += 1
+                            logger.warning(f"Error deleting file {file_path}: {e}")
+                    
+                    logger.info(f"✓ Deleted {deleted_count}/{len(files_to_delete)} files from GCS for merchant {merchant_id}")
+                    if failed_count > 0:
+                        logger.warning(f"⚠ {failed_count} files failed to delete (will continue with database deletion)")
+            except Exception as e:
+                logger.error(f"Error deleting GCS files: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                # Continue with database deletion even if GCS deletion fails
+        
+        # Step 3: Delete database record
+        try:
+            logger.info(f"Deleting database record for merchant {merchant_id}")
+            deleted = delete_merchant(merchant_id, user_id)
+            if deleted:
+                logger.info(f"✓ Deleted database record for merchant {merchant_id}")
+            else:
+                logger.warning(f"Failed to delete database record for merchant {merchant_id}")
+        except Exception as e:
+            logger.error(f"Error deleting database record: {e}")
+        
+        # Step 4: Clean up status tracking
+        try:
+            # Remove from status tracker (in-memory)
+            status_tracker._jobs.pop(merchant_id, None)
+            logger.info(f"✓ Cleaned up status tracking for merchant {merchant_id}")
+        except Exception as e:
+            logger.warning(f"Error cleaning up status tracking: {e}")
+        
+        logger.info(f"✅ Agent deletion completed for merchant {merchant_id}")
+        
+    except Exception as e:
+        logger.error(f"Error in agent deletion process: {e}")
+
+
+@app.delete("/agents/delete")
+async def delete_agent(
+    request: DeleteAgentRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Delete Agent - Remove agent and all associated data
+    
+    This endpoint ALWAYS permanently deletes everything (unconditional):
+    1. Vertex AI datastores (website and docs datastores)
+    2. GCS files (entire merchant folder with all files)
+    3. Database record (merchant and all related data via CASCADE)
+    4. Status tracking data
+    
+    ⚠️ WARNING: This operation is IRREVERSIBLE. All agent data will be permanently deleted.
+    There are no options to skip deletion of any component - everything is always deleted.
+    
+    Args:
+        merchant_id: Merchant identifier
+        user_id: User identifier (for verification)
+    
+    Returns:
+        merchant_id, status, message
+    """
+    try:
+        # Verify merchant exists and belongs to user
+        merchant = get_merchant(request.merchant_id, request.user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        
+        # Start background deletion process (always deletes everything)
+        background_tasks.add_task(
+            process_agent_deletion,
+            merchant_id=request.merchant_id,
+            user_id=request.user_id
+        )
+        
+        logger.info(f"Started agent deletion for merchant {request.merchant_id}")
+        
+        return {
+            "merchant_id": request.merchant_id,
+            "status": "deletion_started",
+            "message": "Agent deletion started. This will permanently delete all agent data including Vertex AI datastores, GCS files, and database records.",
+            "warning": "This operation is irreversible. All agent data will be permanently deleted."
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting agent deletion: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
