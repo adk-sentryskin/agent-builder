@@ -317,7 +317,7 @@ class SaveAIPersonaRequest(BaseModel):
     store_name: str = Field(..., description="Store Name (used to generate merchant_id if not provided)")
     shop_url: str = Field(..., description="Shop URL")
     tone_of_voice: Optional[str] = Field(None, description="Tone of Voice (e.g., Friendly)")
-    platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, custom)")
+    platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, squarespace, custom)")
     top_questions: Optional[List[str]] = Field(None, description="Top-3 Questions (array of 3 questions)")
     top_products: List[str] = Field(..., description="Top-3 product links to sell/promote")
     customer_persona: str = Field(..., description="Describe your ideal customer persona")
@@ -421,7 +421,7 @@ class OnboardRequest(BaseModel):
     logo_url: Optional[str] = None
     platform: Optional[str] = Field(
         None,
-        description="E-commerce platform type: 'shopify', 'woocommerce', 'wordpress', or 'custom'. If not provided, will auto-detect from shop_url."
+        description="E-commerce platform type: 'shopify', 'woocommerce', 'wordpress', 'squarespace', or 'custom'. If not provided, will auto-detect from shop_url."
     )
     custom_url_pattern: Optional[str] = Field(
         None,
@@ -1850,11 +1850,17 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
         if not success:
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
 
-        # Check if merchant is connected via CRM
-        is_connected = get_crm_integrations(merchant_id)
+        # For Shopify only: require CRM connection to mark Step 1 complete. Other platforms: mark without checking.
+        platform_lower = (request.platform or "").strip().lower()
+        if platform_lower == "shopify":
+            is_connected = get_crm_integrations(merchant_id)
+            should_mark_saved = is_connected
+            if not is_connected:
+                logger.info(f"Merchant {merchant_id} (Shopify) does not have CRM integration connected - ai_persona_saved not updated")
+        else:
+            should_mark_saved = True
 
-        # Mark AI Persona as saved only if merchant is connected
-        if is_connected:
+        if should_mark_saved:
             conn = None
             try:
                 conn = get_connection()
@@ -1871,8 +1877,6 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
             finally:
                 if conn:
                     return_connection(conn)
-        else:
-            logger.info(f"Merchant {merchant_id} does not have CRM integration connected - ai_persona_saved not updated")
         
         # Create folder structure immediately after saving AI Persona
         # This ensures folders exist before file uploads in Step 2
@@ -2567,12 +2571,18 @@ async def create_agent(
         
         # Validate steps are completed
         if not merchant.get('ai_persona_saved'):
+            logger.warning(
+                f"create_agent 400: AI Persona not saved for merchant_id={request.merchant_id} user_id={request.user_id}"
+            )
             raise HTTPException(
                 status_code=400,
                 detail="AI Persona (Step 1) not saved. Please complete Step 1 first."
             )
         
         if not merchant.get('knowledge_base_saved'):
+            logger.warning(
+                f"create_agent 400: Knowledge Base not saved for merchant_id={request.merchant_id} user_id={request.user_id}"
+            )
             raise HTTPException(
                 status_code=400,
                 detail="Knowledge Base (Step 2) not saved. Please complete Step 2 first."

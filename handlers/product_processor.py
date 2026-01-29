@@ -199,6 +199,8 @@ class ProductProcessor:
                     url_pattern = '/product/{handle}'  # WooCommerce uses singular "product"
                 elif platform_lower == 'wordpress':
                     url_pattern = '/product/{handle}'  # WordPress/WooCommerce typically uses singular
+                elif platform_lower == 'squarespace':
+                    url_pattern = '/p/{handle}'  # Squarespace commerce typically uses /p/{handle}
                 elif platform_lower == 'custom':
                     # Custom platform but no pattern provided - default to Shopify
                     logger.warning(f"Platform is 'custom' but no custom_url_pattern provided, defaulting to Shopify pattern")
@@ -212,6 +214,8 @@ class ProductProcessor:
                 shop_url_lower = shop_url.lower()
                 if 'woocommerce' in shop_url_lower or 'wordpress' in shop_url_lower:
                     url_pattern = '/product/{handle}'
+                elif 'squarespace' in shop_url_lower:
+                    url_pattern = '/p/{handle}'
                 elif 'shopify' in shop_url_lower or '.myshopify.com' in shop_url_lower:
                     url_pattern = '/products/{handle}'
                 else:
