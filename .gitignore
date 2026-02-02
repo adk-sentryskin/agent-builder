@@ -54,4 +54,5 @@ htmlcov/
 # Project specific
 *.ndjson
 *.json.bak
+vertex-service-account.json
 
