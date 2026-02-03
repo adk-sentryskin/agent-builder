@@ -38,7 +38,9 @@ class ConfigGenerator:
         top_products: Optional[str] = None,
         primary_color: Optional[str] = "#667eea",
         secondary_color: Optional[str] = "#764ba2",
-        logo_url: Optional[str] = None
+        logo_url: Optional[str] = None,
+        platform: Optional[str] = None,
+        custom_url_pattern: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Generate merchant configuration JSON
@@ -58,6 +60,8 @@ class ConfigGenerator:
             primary_color: Primary color
             secondary_color: Secondary color
             logo_url: Logo URL
+            platform: E-commerce platform (shopify, woocommerce, wordpress, squarespace, custom)
+            custom_url_pattern: Custom product URL path for 'custom' platform (e.g. /boutique/p/)
 
         Returns:
             dict with config path and content
@@ -98,6 +102,12 @@ class ConfigGenerator:
             if not full_logo_url and existing_custom_chatbot.get("logo_signed_url"):
                 full_logo_url = existing_custom_chatbot.get("logo_signed_url")
             
+            # Preserve existing platform/product_url_path if not provided (e.g. from update_config)
+            existing_platform = existing_config.get("platform")
+            existing_custom_url = existing_config.get("custom_url_pattern") or existing_config.get("product_url_path")
+            platform_val = (platform or existing_platform or "").strip().lower() or None
+            custom_url_val = (custom_url_pattern or existing_custom_url or "").strip() or None
+
             # Build the complete config structure
             config = {
                 "user_id": user_id,
@@ -117,7 +127,8 @@ class ConfigGenerator:
                 "vertex_search": {
                     "project_id": self.project_id,
                     "location": self.location,
-                    "datastore_id": f"{merchant_id}-engine"
+                    "datastore_id": f"{merchant_id}-docs-engine",
+                    "website_id": f"{merchant_id}-website-engine"
                 },
                 "branding": {
                     "primary_color": primary_color or "#667eea",
@@ -141,7 +152,8 @@ class ConfigGenerator:
                 }
             }
 
-            # Add optional fields (only if provided)
+            # Add optional fields (only if provided). platform/custom_url_pattern are synced from DB
+            # whenever config is generated (onboarding, save_ai_persona, PATCH merchant).
             if target_customer:
                 config["target_customer"] = target_customer
             if customer_persona:
@@ -154,6 +166,13 @@ class ConfigGenerator:
                 config["top_questions"] = top_questions
             if top_products:
                 config["top_products"] = top_products
+            if platform_val:
+                config["platform"] = platform_val
+            if custom_url_val:
+                config["custom_url_pattern"] = custom_url_val
+                # Langflow expects product_url_path as prefix (e.g. /boutique/p/); derive from pattern like /boutique/p/{handle}
+                path_prefix = custom_url_val.replace("{handle}", "").replace("{}", "").rstrip("/") + "/"
+                config["product_url_path"] = path_prefix
 
             # Upload config to GCS - Langflow expects merchant_config.json
             config_path = f"merchants/{merchant_id}/merchant_config.json"

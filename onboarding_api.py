@@ -1128,7 +1128,9 @@ async def process_onboarding(
                 top_products=top_products,
                 primary_color=primary_color,
                 secondary_color=secondary_color,
-                logo_url=logo_url
+                logo_url=logo_url,
+                platform=platform,
+                custom_url_pattern=custom_url_pattern
             )
             # Update database with config generation results
             config_path = config_result.get('config_path', f"merchants/{merchant_id}/merchant_config.json")
@@ -1928,7 +1930,9 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
                         top_products=merchant_data.get('top_products') or top_products_str,
                         primary_color=merchant_data.get('primary_color', "#667eea"),
                         secondary_color=merchant_data.get('secondary_color', "#764ba2"),
-                        logo_url=merchant_data.get('logo_url')
+                        logo_url=merchant_data.get('logo_url'),
+                        platform=merchant_data.get('platform') or getattr(request, 'platform', None),
+                        custom_url_pattern=merchant_data.get('custom_url_pattern') or getattr(request, 'custom_url_pattern', None)
                     )
                     config_updated = True
                     logger.info(f"✅ Updated merchant_config.json for merchant: {merchant_id}")
@@ -3891,7 +3895,7 @@ async def update_merchant_info(
             'shop_name', 'shop_url', 'bot_name', 'primary_color', 
             'secondary_color', 'logo_url', 'target_customer',
             'customer_persona', 'bot_tone', 'prompt_text',
-            'top_questions', 'top_products'
+            'top_questions', 'top_products', 'platform', 'custom_url_pattern'
         ]
         
         # Fields that require Vertex AI Search datastore update
@@ -3939,7 +3943,9 @@ async def update_merchant_info(
                     top_products=updated_merchant.get('top_products'),
                     primary_color=updated_merchant.get('primary_color', '#667eea'),
                     secondary_color=updated_merchant.get('secondary_color', '#764ba2'),
-                    logo_url=updated_merchant.get('logo_url')
+                    logo_url=updated_merchant.get('logo_url'),
+                    platform=updated_merchant.get('platform'),
+                    custom_url_pattern=updated_merchant.get('custom_url_pattern')
                 )
                 
                 logger.info(f"Config regenerated for merchant {merchant_id} after field updates: {[f for f in updates.keys() if f in config_relevant_fields]}")

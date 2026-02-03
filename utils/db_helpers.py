@@ -732,7 +732,8 @@ def update_merchant(
             'shop_name', 'shop_url', 'bot_name', 'target_customer',
             'customer_persona', 'bot_tone', 'prompt_text',
             'top_questions', 'top_products', 'primary_color', 
-            'secondary_color', 'logo_url', 'status'
+            'secondary_color', 'logo_url', 'status',
+            'platform', 'custom_url_pattern'
         ]
         
         update_fields = []
