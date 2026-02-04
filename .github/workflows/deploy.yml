@@ -158,7 +158,7 @@ jobs:
           image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           region: ${{ env.REGION }}
           flags: |
-            --port=8000
+            --port=8080
             --cpu=1
             --memory=1Gi
             --min-instances=0
@@ -206,7 +206,7 @@ jobs:
           image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
           region: ${{ env.REGION }}
           flags: |
-            --port=8000
+            --port=8080
             --cpu=2
             --memory=2Gi
             --min-instances=1

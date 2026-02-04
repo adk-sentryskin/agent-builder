@@ -34,28 +34,28 @@ echo ""
 PROJECT_ID="${GCP_PROJECT_ID:-shopify-473015}"
 REGION="${GCP_REGION:-us-central1}"
 
-# Environment-specific configuration
+# Environment-specific configuration (aligned with GitHub Actions workflow)
 if [ "$ENVIRONMENT" = "staging" ]; then
-    SERVICE_NAME="merchant-onboarding-api-staging"
+    SERVICE_NAME="agent-builder-dev"
     MEMORY="1Gi"
     CPU="1"
     MIN_INSTANCES="0"
-    MAX_INSTANCES="5"
+    MAX_INSTANCES="10"
     TIMEOUT="300"
     LOG_LEVEL="INFO"
     DEBUG="true"
 else  # production
-    SERVICE_NAME="merchant-onboarding-api"
+    SERVICE_NAME="agent-builder"
     MEMORY="2Gi"
     CPU="2"
     MIN_INSTANCES="1"
-    MAX_INSTANCES="10"
-    TIMEOUT="3600"
+    MAX_INSTANCES="100"
+    TIMEOUT="300"
     LOG_LEVEL="WARNING"
     DEBUG="false"
 fi
 
-IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
+IMAGE_NAME="gcr.io/${PROJECT_ID}/agent-builder"
 
 # =============================================================================
 # Production Confirmation
@@ -130,7 +130,8 @@ gcloud run deploy ${SERVICE_NAME} \
     --timeout ${TIMEOUT} \
     --min-instances ${MIN_INSTANCES} \
     --max-instances ${MAX_INSTANCES} \
-    --set-env-vars="ENVIRONMENT=${ENVIRONMENT},DEBUG=${DEBUG},LOG_LEVEL=${LOG_LEVEL}"
+    --set-env-vars="ENVIRONMENT=${ENVIRONMENT},DEBUG=${DEBUG},LOG_LEVEL=${LOG_LEVEL},GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION}" \
+    --set-secrets="STORAGE_BUCKET_NAME=STORAGE_BUCKET_NAME:latest,GCS_PROJECT_ID=GCS_PROJECT_ID:latest,SA_PRIVATE_KEY=SA_PRIVATE_KEY:latest,SA_CLIENT_EMAIL=SA_CLIENT_EMAIL:latest"
 
 # =============================================================================
 # Post-deployment
@@ -166,10 +167,9 @@ echo "Project:      ${PROJECT_ID}"
 echo "Region:       ${REGION}"
 echo "==============================================${NC}"
 echo ""
-echo -e "${YELLOW}Note: Make sure environment variables are set in Cloud Run:${NC}"
-echo "   - GCS_CLIENT_EMAIL"
-echo "   - GCS_PRIVATE_KEY"
-echo "   - GCS_BUCKET_NAME"
-echo "   - VERTEX_CLIENT_EMAIL (optional)"
-echo "   - VERTEX_PRIVATE_KEY (optional)"
+echo -e "${YELLOW}Note: Make sure secrets are configured in Secret Manager:${NC}"
+echo "   - STORAGE_BUCKET_NAME"
+echo "   - GCS_PROJECT_ID"
+echo "   - SA_PRIVATE_KEY"
+echo "   - SA_CLIENT_EMAIL"
 echo "   - DB_DSN (if using database features)"
