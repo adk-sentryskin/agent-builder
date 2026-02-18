@@ -218,7 +218,7 @@ class VertexSetup:
         merchant_id: str,
         shop_url: Optional[str] = None,
         shop_name: Optional[str] = None,
-        create_documents_datastore: bool = True
+        create_documents_datastore: bool = False
     ) -> Dict[str, Any]:
         """
         Create or get Vertex AI Search datastores

@@ -23,6 +23,7 @@ from handlers.product_processor import ProductProcessor
 from handlers.document_converter import DocumentConverter
 from handlers.vertex_setup import VertexSetup
 from handlers.config_generator import ConfigGenerator
+from handlers.product_importer import ProductImporter
 from utils.status_tracker import StatusTracker, StepStatus
 from utils.db_helpers import (
     get_merchant, create_merchant, update_merchant, delete_merchant,
@@ -47,13 +48,14 @@ product_processor = None
 document_converter = None
 vertex_setup = None
 config_generator = None
+product_importer = None
 status_tracker = StatusTracker()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
-    global gcs_handler, product_processor, document_converter, vertex_setup, config_generator
+    global gcs_handler, product_processor, document_converter, vertex_setup, config_generator, product_importer
 
     # Startup
     logger.info("Starting Merchant Onboarding Service...")
@@ -63,6 +65,7 @@ async def lifespan(app: FastAPI):
         document_converter = DocumentConverter(gcs_handler)
         vertex_setup = VertexSetup()
         config_generator = ConfigGenerator(gcs_handler)
+        product_importer = ProductImporter(gcs_handler)
         logger.info("All handlers initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize handlers: {e}")
@@ -861,6 +864,33 @@ async def process_onboarding(
                 message="No categories file found in knowledge_base"
             )
 
+        # Step 2c: Import products to platform-specific database table
+        # This makes products searchable by the chatbot's search_products tool (pgvector)
+        if products_file_path and platform and platform.strip().lower() in ('shopify', 'woocommerce', 'squarespace'):
+            status_tracker.update_step_status(
+                merchant_id, "import_products_db", StepStatus.IN_PROGRESS
+            )
+            try:
+                import_result = product_importer.import_products(
+                    merchant_id=merchant_id,
+                    platform=platform,
+                    products_file_path=products_file_path,
+                    shop_url=shop_url,
+                    shop_name=shop_name,
+                )
+                status_tracker.update_step_status(
+                    merchant_id, "import_products_db", StepStatus.COMPLETED,
+                    message=f"Imported {import_result.get('product_count', 0)} products to {platform} table with embeddings"
+                )
+                logger.info(f"✅ Imported {import_result.get('product_count', 0)} products to {platform} table for {merchant_id}")
+            except Exception as e:
+                logger.error(f"Product DB import failed for {merchant_id}: {e}")
+                status_tracker.update_step_status(
+                    merchant_id, "import_products_db", StepStatus.FAILED,
+                    error=str(e)
+                )
+                # Don't raise — products.json is still available for prompt context
+
         # Step 3: Convert documents
         # ONLY check knowledge_base folder - collect all files except products.csv and categories.csv
         document_paths = []
@@ -958,92 +988,13 @@ async def process_onboarding(
                     elif site_reg.get("status") == "error":
                         logger.warning(f"⚠️ Website registration had errors: {site_reg.get('error')}")
             
-            if datastore_result.get("documents_datastore"):
-                docs_ds = datastore_result["documents_datastore"]
-                logger.info(f"✅ Documents datastore: {docs_ds.get('datastore_id')} ({docs_ds.get('status')})")
-                logger.info(f"   This datastore is used for NDJSON document imports (knowledge base, products, categories)")
-
-            # Start document imports asynchronously (don't wait for completion)
-            # Store operation names for status checking
-            import_operations = []
-            import_errors = []
-            
-            documents_ndjson_path = f"merchants/{merchant_id}/training_files/documents.ndjson"
-            if gcs_handler.file_exists(documents_ndjson_path):
-                try:
-                    gcs_uri = f"gs://{gcs_handler.bucket_name}/{documents_ndjson_path}"
-                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri)
-                    import_operations.append({
-                        "type": "documents",
-                        "operation_name": result.get("operation_name"),
-                        "gcs_uri": gcs_uri
-                    })
-                    logger.info(f"Started async document import: {result.get('operation_name')}")
-                except Exception as import_error:
-                    error_msg = str(import_error)
-                    import_errors.append(f"documents: {error_msg}")
-                    logger.error(f"Failed to start document import: {error_msg}")
-
-            # Import products if available (check if products.ndjson was created)
-            # Use INCREMENTAL to preserve existing documents (knowledge base)
-            products_ndjson_path = f"merchants/{merchant_id}/training_files/products.ndjson"
-            if gcs_handler.file_exists(products_ndjson_path):
-                try:
-                    gcs_uri = f"gs://{gcs_handler.bucket_name}/{products_ndjson_path}"
-                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                    import_operations.append({
-                        "type": "products",
-                        "operation_name": result.get("operation_name"),
-                        "gcs_uri": gcs_uri
-                    })
-                    logger.info(f"Started async products import: {result.get('operation_name')}")
-                except Exception as import_error:
-                    error_msg = str(import_error)
-                    import_errors.append(f"products: {error_msg}")
-                    logger.error(f"Failed to start products import: {error_msg}")
-
-            # Import categories if available (check if categories.ndjson was created)
-            # Use INCREMENTAL to preserve existing documents (knowledge base and products)
-            categories_ndjson_path = f"merchants/{merchant_id}/training_files/categories.ndjson"
-            if gcs_handler.file_exists(categories_ndjson_path):
-                try:
-                    gcs_uri = f"gs://{gcs_handler.bucket_name}/{categories_ndjson_path}"
-                    result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                    import_operations.append({
-                        "type": "categories",
-                        "operation_name": result.get("operation_name"),
-                        "gcs_uri": gcs_uri
-                    })
-                    logger.info(f"Started async categories import: {result.get('operation_name')}")
-                except Exception as import_error:
-                    error_msg = str(import_error)
-                    import_errors.append(f"categories: {error_msg}")
-                    logger.error(f"Failed to start categories import: {error_msg}")
-
-            # Store import operations in status tracker for monitoring
-            # Also store import errors so status endpoint can show them
-            status = status_tracker.get_status(merchant_id)
-            if status:
-                if import_operations:
-                    status["document_import_operations"] = import_operations
-                    status["document_import_status"] = "in_progress"
-                    logger.info(f"Stored {len(import_operations)} import operations for monitoring")
-                elif import_errors:
-                    # Store errors even if no operations started (e.g., conflict errors)
-                    status["document_import_errors"] = import_errors
-                    status["document_import_status"] = "error"
-                    status["document_import_message"] = f"Failed to start imports: {', '.join(import_errors)}"
-                    logger.warning(f"Document import failed to start: {', '.join(import_errors)}")
+            # Note: docs-engine removed — documents are embedded directly into PostgreSQL
+            # document_chunks table via document_converter.py (pgvector search)
 
             # Build status message
-            message = "Vertex AI Search datastore configured"
+            message = "Vertex AI Search website datastore configured"
             if shop_url:
                 message += f" with website crawling for {shop_url}"
-            
-            if import_operations:
-                message += f". Started async import for: {', '.join([op['type'] for op in import_operations])}"
-            elif import_errors:
-                message += f". Import errors: {', '.join(import_errors)}"
             
             # Update database with Vertex setup results
             vertex_datastore_id = datastore_result.get('datastore_id', f"{merchant_id}-engine")
@@ -1157,12 +1108,14 @@ async def process_onboarding(
             )
             raise
 
-        # Step 6: Finalize
+        # Step 6: Finalize — mark agent_created=TRUE immediately
+        # (No more waiting for Vertex AI docs-engine imports)
         update_merchant_onboarding_step(
             merchant_id=merchant_id,
             step_name='onboarding',
             completed=True
         )
+        _mark_agent_created(merchant_id, user_id, "Onboarding completed")
         status_tracker.update_step_status(
             merchant_id, "finalize", StepStatus.COMPLETED,
             message="Onboarding completed successfully"
@@ -1269,27 +1222,18 @@ async def process_agent_update(
                         message=f"Re-processed {result.get('product_count', 0)} products"
                     )
                     
-                    # Re-import products to Vertex AI (INCREMENTAL mode) - async
-                    products_ndjson_path = f"merchants/{merchant_id}/training_files/products.ndjson"
-                    if gcs_handler.file_exists(products_ndjson_path):
+                    # Also import to platform-specific DB table with embeddings
+                    if platform and platform.strip().lower() in ('shopify', 'woocommerce', 'squarespace'):
                         try:
-                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{products_ndjson_path}"
-                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Started async re-import of products to Vertex AI: {result.get('operation_name')}")
-                            # Store operation for status tracking
-                            status = status_tracker.get_status(merchant_id)
-                            if status:
-                                if "document_import_operations" not in status:
-                                    status["document_import_operations"] = []
-                                status["document_import_operations"].append({
-                                    "type": "products",
-                                    "operation_name": result.get("operation_name"),
-                                    "gcs_uri": gcs_uri
-                                })
-                                status["document_import_status"] = "in_progress"
-                        except Exception as e:
-                            logger.error(f"Failed to start async re-import of products to Vertex AI: {e}")
-                            # Log error but continue - Vertex AI import failures don't stop the update
+                            import_result = product_importer.import_products(
+                                merchant_id=merchant_id,
+                                platform=platform,
+                                products_file_path=products_file_path,
+                                shop_url=shop_url,
+                            )
+                            logger.info(f"Re-imported {import_result.get('product_count', 0)} products to {platform} table")
+                        except Exception as import_err:
+                            logger.error(f"Product DB re-import failed: {import_err}")
                 except Exception as e:
                     logger.error(f"Error re-processing products: {e}")
                     update_merchant_onboarding_step(
@@ -1340,27 +1284,7 @@ async def process_agent_update(
                         message=f"Re-processed {result.get('category_count', 0)} categories"
                     )
                     
-                    # Re-import categories to Vertex AI (INCREMENTAL mode) - async
-                    categories_ndjson_path = f"merchants/{merchant_id}/training_files/categories.ndjson"
-                    if gcs_handler.file_exists(categories_ndjson_path):
-                        try:
-                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{categories_ndjson_path}"
-                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Started async re-import of categories to Vertex AI: {result.get('operation_name')}")
-                            # Store operation for status tracking
-                            status = status_tracker.get_status(merchant_id)
-                            if status:
-                                if "document_import_operations" not in status:
-                                    status["document_import_operations"] = []
-                                status["document_import_operations"].append({
-                                    "type": "categories",
-                                    "operation_name": result.get("operation_name"),
-                                    "gcs_uri": gcs_uri
-                                })
-                                status["document_import_status"] = "in_progress"
-                        except Exception as e:
-                            logger.error(f"Failed to start async re-import of categories to Vertex AI: {e}")
-                            # Log error but continue - Vertex AI import failures don't stop the update
+                    # Categories no longer imported to Vertex AI docs-engine
                 except Exception as e:
                     logger.error(f"Error re-processing categories: {e}")
                     update_merchant_onboarding_step(
@@ -1412,34 +1336,8 @@ async def process_agent_update(
                         message=f"Re-converted {result.get('document_count', 0)} documents"
                     )
                     
-                    # Re-import documents to Vertex AI (INCREMENTAL mode - adds/updates only) - async
-                    documents_ndjson_path = f"merchants/{merchant_id}/training_files/documents.ndjson"
-                    if gcs_handler.file_exists(documents_ndjson_path):
-                        try:
-                            gcs_uri = f"gs://{gcs_handler.bucket_name}/{documents_ndjson_path}"
-                            result = vertex_setup.start_import_documents_async(merchant_id, gcs_uri, import_type="INCREMENTAL")
-                            logger.info(f"Started async re-import of documents to Vertex AI: {result.get('operation_name')}")
-                            # Store operation for status tracking
-                            status = status_tracker.get_status(merchant_id)
-                            if status:
-                                if "document_import_operations" not in status:
-                                    status["document_import_operations"] = []
-                                status["document_import_operations"].append({
-                                    "type": "documents",
-                                    "operation_name": result.get("operation_name"),
-                                    "gcs_uri": gcs_uri
-                                })
-                                status["document_import_status"] = "in_progress"
-                                status["message"] = "Documents re-converted. Import to Vertex AI started (async)."
-                                status["updated_at"] = datetime.utcnow().isoformat()
-                        except Exception as e:
-                            logger.error(f"Failed to start async re-import of documents to Vertex AI: {e}")
-                            # Log error but continue - Vertex AI import failures don't stop the update
-                            # Update job status to indicate partial failure
-                            status = status_tracker.get_status(merchant_id)
-                            if status:
-                                status["message"] = f"Documents re-converted but Vertex AI import failed: {str(e)}"
-                                status["updated_at"] = datetime.utcnow().isoformat()
+                    # Documents are embedded into PostgreSQL document_chunks (pgvector)
+                    # No Vertex AI docs-engine import needed
                 else:
                     status_tracker.update_step_status(
                         merchant_id, "convert_documents", StepStatus.SKIPPED,
@@ -2614,9 +2512,8 @@ async def create_agent(
                 "message": f"Missing required fields: {', '.join(missing_fields)}"
             }
         
-        # NOTE: Don't mark agent_created yet - wait for document import to complete
-        # agent_created will be set to TRUE when document import completes successfully
-        # This is handled by the monitor_document_import_completion background task
+        # agent_created is now set to TRUE immediately when onboarding completes
+        # (no more waiting for Vertex AI docs-engine imports)
         
         # Extract file paths from knowledge_base_files JSONB
         import json
@@ -2805,17 +2702,14 @@ async def process_agent_deletion(
                     logger.warning(f"Failed to delete website datastore: {result.get('error')}")
                     # Continue with other deletions even if this fails
                 
-                # Delete documents datastore
+                # Note: docs-engine no longer created for new merchants
+                # Attempt cleanup for legacy merchants that may still have one
                 docs_datastore_id = f"{merchant_id}-docs-engine"
-                logger.info(f"Deleting documents datastore: {docs_datastore_id}")
-                result = vertex_setup.delete_datastore(docs_datastore_id)
-                if result.get("success"):
-                    logger.info(f"✓ Deleted documents datastore: {result.get('message')}")
-                    if result.get("warning"):
-                        logger.warning(f"Documents datastore deletion: {result.get('warning')}")
-                else:
-                    logger.warning(f"Failed to delete documents datastore: {result.get('error')}")
-                    # Continue with other deletions even if this fails
+                try:
+                    vertex_setup.delete_datastore(docs_datastore_id)
+                    logger.info(f"✓ Cleaned up legacy docs datastore: {docs_datastore_id}")
+                except Exception:
+                    pass  # Expected for new merchants that never had docs-engine
             except Exception as e:
                 logger.error(f"Error deleting Vertex AI datastores: {e}")
                 import traceback
@@ -3114,51 +3008,51 @@ async def get_onboarding_status(merchant_id: str):
                 else:
                     for op_info in import_operations:
                         operation_name = op_info.get("operation_name")
-                    if operation_name:
-                        try:
-                            op_status = vertex_setup.check_import_status(operation_name)
-                            op_status_value = op_status.get("status")
-                            
-                            import_statuses.append({
-                                "type": op_info.get("type"),
-                                "operation_name": operation_name,
-                                "status": op_status_value,
-                                "error": op_status.get("error") if op_status_value == "failed" else None,
-                                "message": op_status.get("message")
-                            })
-                            
-                            # Track completion
-                            if op_status_value == "completed":
-                                completed_count += 1
-                            elif op_status_value == "failed":
-                                failed_count += 1
-                                any_failed = True
-                            elif op_status_value == "in_progress":
-                                in_progress_count += 1
-                                all_completed = False
-                            else:
+                        if operation_name:
+                            try:
+                                op_status = vertex_setup.check_import_status(operation_name)
+                                op_status_value = op_status.get("status")
+                                
+                                import_statuses.append({
+                                    "type": op_info.get("type"),
+                                    "operation_name": operation_name,
+                                    "status": op_status_value,
+                                    "error": op_status.get("error") if op_status_value == "failed" else None,
+                                    "message": op_status.get("message")
+                                })
+                                
+                                # Track completion
+                                if op_status_value == "completed":
+                                    completed_count += 1
+                                elif op_status_value == "failed":
+                                    failed_count += 1
+                                    any_failed = True
+                                elif op_status_value == "in_progress":
+                                    in_progress_count += 1
+                                    all_completed = False
+                                else:
+                                    unknown_count += 1
+                                    all_completed = False
+                                    
+                            except Exception as e:
+                                logger.warning(f"Error checking import status for {operation_name}: {e}")
+                                import_statuses.append({
+                                    "type": op_info.get("type"),
+                                    "operation_name": operation_name,
+                                    "status": "unknown",
+                                    "error": str(e)
+                                })
                                 unknown_count += 1
                                 all_completed = False
-                                
-                        except Exception as e:
-                            logger.warning(f"Error checking import status for {operation_name}: {e}")
+                        else:
                             import_statuses.append({
                                 "type": op_info.get("type"),
-                                "operation_name": operation_name,
+                                "operation_name": None,
                                 "status": "unknown",
-                                "error": str(e)
+                                "error": "Operation name not available"
                             })
                             unknown_count += 1
                             all_completed = False
-                    else:
-                        import_statuses.append({
-                            "type": op_info.get("type"),
-                            "operation_name": None,
-                            "status": "unknown",
-                            "error": "Operation name not available"
-                        })
-                        unknown_count += 1
-                        all_completed = False
                 
                 # Update status based on current check (only if we have operations)
                 # Check if all operations are actually completed (no running operations)
@@ -3676,6 +3570,18 @@ async def get_merchant_config(
         try:
             file_content = gcs_handler.download_file(config_path)
             config = json.loads(file_content.decode('utf-8'))
+            
+            # Always merge platform and custom_url_pattern from DB (DB is source of truth)
+            merchant_for_platform = get_merchant(merchant_id, user_id) if user_id else get_merchant(merchant_id, user_id=None)
+            if merchant_for_platform:
+                db_platform = merchant_for_platform.get("platform")
+                if db_platform:
+                    config["platform"] = str(db_platform).strip().lower()
+                db_custom = merchant_for_platform.get("custom_url_pattern")
+                if db_custom:
+                    config["custom_url_pattern"] = str(db_custom).strip()
+                    path_prefix = str(db_custom).replace("{handle}", "").replace("{}", "").rstrip("/") + "/"
+                    config["product_url_path"] = path_prefix
             
             # Generate signed URLs for logos if they exist
             # Extract GCS path from public URL and generate signed URL (with security validation)

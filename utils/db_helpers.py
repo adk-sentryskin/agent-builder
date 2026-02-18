@@ -375,9 +375,17 @@ def check_subscription(user_id: str) -> bool:
         True if user has active subscription or is a production user
     """
     # Development bypass: Skip subscription check if SKIP_SUBSCRIPTION_CHECK is set
+    # NEVER allow bypass in production — this is a security guard
     if os.getenv("SKIP_SUBSCRIPTION_CHECK", "").lower() in ("true", "1", "yes"):
-        logger.info(f"SKIP_SUBSCRIPTION_CHECK enabled - bypassing subscription check for user {user_id}")
-        return True
+        if os.getenv("ENVIRONMENT", "development").lower() == "production":
+            logger.critical(
+                f"SKIP_SUBSCRIPTION_CHECK bypass attempted in PRODUCTION for user {user_id} — BLOCKED. "
+                "Remove SKIP_SUBSCRIPTION_CHECK env var from production deployment."
+            )
+            # Fall through to actual subscription check
+        else:
+            logger.info(f"SKIP_SUBSCRIPTION_CHECK enabled - bypassing subscription check for user {user_id}")
+            return True
     
     conn = None
     try:

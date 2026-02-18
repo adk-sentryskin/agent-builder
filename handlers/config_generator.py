@@ -127,7 +127,6 @@ class ConfigGenerator:
                 "vertex_search": {
                     "project_id": self.project_id,
                     "location": self.location,
-                    "datastore_id": f"{merchant_id}-docs-engine",
                     "website_id": f"{merchant_id}-website-engine"
                 },
                 "branding": {

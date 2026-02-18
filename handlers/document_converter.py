@@ -1,17 +1,21 @@
-"""Document converter to NDJSON format for Vertex AI Search"""
+"""Document converter to NDJSON format for Vertex AI Search + pgvector embeddings"""
 
 import os
 import json
 import re
 import base64
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from io import BytesIO
 import PyPDF2
 from docx import Document
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Vertex AI embedding model (lazy-loaded)
+_embedding_model = None
+_aiplatform_initialized = False
 
 
 class DocumentConverter:
@@ -86,9 +90,13 @@ class DocumentConverter:
             if skipped_files:
                 logger.warning(f"Skipped {len(skipped_files)} files: {skipped_files}")
 
+            # Generate embeddings and store in document_chunks table for chatbot RAG
+            chunks_stored = self._store_document_embeddings(merchant_id, all_documents)
+
             return {
                 "ndjson_path": ndjson_path,
                 "document_count": len(all_documents),
+                "chunks_stored": chunks_stored,
                 "skipped_files": skipped_files if skipped_files else None
             }
 
@@ -123,9 +131,12 @@ class DocumentConverter:
             logger.warning(f"Unsupported file type: {doc_path}, treating as text")
             text_content = file_content.decode('utf-8', errors='ignore')
 
-        # Split into chunks if document is too large
-        max_chunk_size = 10000  # characters per chunk
-        chunks = self._split_text(text_content, max_chunk_size)
+        # Split into chunks for RAG retrieval
+        # 1000 chars ≈ 250 tokens — optimal for embedding + retrieval accuracy
+        # 200 char overlap ensures context isn't lost at chunk boundaries
+        max_chunk_size = 1000  # characters per chunk
+        overlap = 200  # characters of overlap between chunks
+        chunks = self._split_text(text_content, max_chunk_size, overlap)
 
         documents = []
         for i, chunk in enumerate(chunks):
@@ -226,13 +237,17 @@ class DocumentConverter:
             logger.error(f"Error extracting HTML text: {e}")
             raise
 
-    def _split_text(self, text: str, max_size: int) -> List[str]:
+    def _split_text(self, text: str, max_size: int, overlap: int = 0) -> List[str]:
         """
-        Split text into chunks
+        Split text into chunks with optional overlap.
+
+        Strategy: split on paragraph boundaries first, then sentence boundaries.
+        Overlap is added by prepending the tail of the previous chunk to the next.
 
         Args:
             text: Text to split
-            max_size: Maximum chunk size
+            max_size: Maximum chunk size in characters
+            overlap: Number of characters to overlap between consecutive chunks
 
         Returns:
             List of text chunks
@@ -240,10 +255,10 @@ class DocumentConverter:
         if len(text) <= max_size:
             return [text]
 
-        chunks = []
+        # First pass: split into segments respecting paragraph/sentence boundaries
+        segments = []
         current_chunk = ""
 
-        # Try to split on paragraphs first
         paragraphs = text.split('\n\n')
 
         for paragraph in paragraphs:
@@ -251,24 +266,198 @@ class DocumentConverter:
                 current_chunk += paragraph + '\n\n'
             else:
                 if current_chunk:
-                    chunks.append(current_chunk.strip())
+                    segments.append(current_chunk.strip())
                 # If paragraph itself is too large, split by sentences
                 if len(paragraph) > max_size:
                     sentences = paragraph.split('. ')
+                    current_chunk = ""
                     for sentence in sentences:
                         if len(current_chunk) + len(sentence) + 2 <= max_size:
                             current_chunk += sentence + '. '
                         else:
                             if current_chunk:
-                                chunks.append(current_chunk.strip())
+                                segments.append(current_chunk.strip())
                             current_chunk = sentence + '. '
                 else:
                     current_chunk = paragraph + '\n\n'
 
         if current_chunk:
-            chunks.append(current_chunk.strip())
+            segments.append(current_chunk.strip())
+
+        # Second pass: add overlap between chunks
+        if overlap <= 0 or len(segments) <= 1:
+            return segments
+
+        chunks = [segments[0]]
+        for i in range(1, len(segments)):
+            prev = segments[i - 1]
+            # Take the last `overlap` characters from the previous segment
+            overlap_text = prev[-overlap:] if len(prev) > overlap else prev
+            # Trim to start at a word boundary (don't cut mid-word)
+            space_idx = overlap_text.find(' ')
+            if space_idx > 0:
+                overlap_text = overlap_text[space_idx + 1:]
+            chunk = overlap_text + " " + segments[i]
+            # Ensure we don't exceed max_size after adding overlap
+            if len(chunk) > max_size:
+                chunk = chunk[:max_size]
+            chunks.append(chunk.strip())
 
         return chunks
+
+    def _get_embedding_model(self):
+        """Get or create the Vertex AI text embedding model (cached)."""
+        global _embedding_model, _aiplatform_initialized
+
+        if not _aiplatform_initialized:
+            from google.cloud import aiplatform
+            project_id = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT", "shopify-473015")
+            region = os.getenv("GCP_REGION", "us-central1")
+            aiplatform.init(project=project_id, location=region)
+            _aiplatform_initialized = True
+
+        if _embedding_model is None:
+            from vertexai.language_models import TextEmbeddingModel
+            _embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+            logger.info("Loaded text-embedding-004 model for document embeddings")
+
+        return _embedding_model
+
+    def _generate_embeddings_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """
+        Generate embeddings for a batch of texts using Vertex AI.
+
+        Args:
+            texts: List of text strings to embed (max 250 per batch per API limit)
+
+        Returns:
+            List of embedding vectors (768 dimensions each), or None for failed items
+        """
+        try:
+            from vertexai.language_models import TextEmbeddingInput
+            model = self._get_embedding_model()
+
+            # Truncate texts to 20K chars (model limit) and create inputs
+            inputs = [
+                TextEmbeddingInput(text=t[:20000], task_type="RETRIEVAL_DOCUMENT")
+                for t in texts
+            ]
+
+            embeddings_result = model.get_embeddings(inputs)
+            return [e.values for e in embeddings_result]
+
+        except Exception as e:
+            logger.error(f"Embedding generation failed for batch of {len(texts)}: {e}")
+            return [None] * len(texts)
+
+    def _store_document_embeddings(self, merchant_id: str, documents: List[Dict[str, Any]]) -> int:
+        """
+        Generate embeddings for document chunks and store in document_chunks table.
+        Deletes existing chunks for the merchant first (full refresh).
+
+        Args:
+            merchant_id: Merchant identifier
+            documents: List of Vertex AI Search formatted documents (with content.raw_bytes)
+
+        Returns:
+            Number of chunks successfully stored
+        """
+        from utils.db_helpers import get_connection, return_connection
+
+        conn = None
+        stored = 0
+
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            # Delete existing chunks for this merchant (full refresh)
+            cursor.execute(
+                "DELETE FROM public.document_chunks WHERE merchant_id = %s",
+                (merchant_id,)
+            )
+            deleted = cursor.rowcount
+            if deleted > 0:
+                logger.info(f"Deleted {deleted} existing document chunks for merchant {merchant_id}")
+
+            # Extract plain text content from each document
+            chunk_data = []
+            for doc in documents:
+                # Decode base64 content back to text
+                raw_bytes = doc.get("content", {}).get("raw_bytes", "")
+                try:
+                    content = base64.b64decode(raw_bytes).decode("utf-8")
+                except Exception:
+                    content = ""
+
+                if not content.strip():
+                    continue
+
+                struct = doc.get("struct_data", {})
+                chunk_data.append({
+                    "content": content,
+                    "title": struct.get("title", ""),
+                    "source": struct.get("source", ""),
+                    "chunk_index": struct.get("chunk_index", 0),
+                    "total_chunks": struct.get("total_chunks", 1),
+                })
+
+            if not chunk_data:
+                logger.warning(f"No valid chunks to embed for merchant {merchant_id}")
+                conn.commit()
+                return 0
+
+            # Generate embeddings in batches of 25
+            batch_size = 25
+            for i in range(0, len(chunk_data), batch_size):
+                batch = chunk_data[i:i + batch_size]
+                texts = [c["content"] for c in batch]
+
+                logger.info(
+                    f"Generating embeddings for chunks {i+1}-{i+len(batch)} "
+                    f"of {len(chunk_data)} for merchant {merchant_id}"
+                )
+
+                embeddings = self._generate_embeddings_batch(texts)
+
+                for chunk, embedding in zip(batch, embeddings):
+                    if embedding is None:
+                        logger.warning(f"Skipping chunk '{chunk['title']}' — embedding failed")
+                        continue
+
+                    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
+
+                    cursor.execute(
+                        """
+                        INSERT INTO public.document_chunks
+                            (merchant_id, content, title, source, chunk_index, total_chunks, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+                        """,
+                        (
+                            merchant_id,
+                            chunk["content"],
+                            chunk["title"],
+                            chunk["source"],
+                            chunk["chunk_index"],
+                            chunk["total_chunks"],
+                            embedding_str,
+                        )
+                    )
+                    stored += 1
+
+            conn.commit()
+            logger.info(f"Stored {stored} document chunks with embeddings for merchant {merchant_id}")
+            return stored
+
+        except Exception as e:
+            logger.error(f"Error storing document embeddings for merchant {merchant_id}: {e}", exc_info=True)
+            if conn:
+                conn.rollback()
+            return stored
+
+        finally:
+            if conn:
+                return_connection(conn)
 
     def _create_ndjson(self, documents: List[Dict[str, Any]]) -> str:
         """

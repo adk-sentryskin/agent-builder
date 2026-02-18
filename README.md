@@ -900,7 +900,8 @@ Generated `config.json` structure:
   "vertex_search": {
     "project_id": "shopify-473015",
     "location": "global",
-    "datastore_id": "{merchant_id}-engine"
+    "datastore_id": "{merchant_id}-docs-engine",
+    "website_id": "{merchant_id}-website-engine"
   }
 }
 ```
