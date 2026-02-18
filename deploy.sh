@@ -90,6 +90,47 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" &> /dev/n
 fi
 
 # =============================================================================
+# Environment Variables (required for service to function)
+# =============================================================================
+
+# Database — required for all merchant operations
+DB_DSN="${DB_DSN:?ERROR: DB_DSN environment variable is required (e.g. postgresql://user:pass@host:5432/dbname)}"
+
+# GCS — required for file uploads, config storage
+GCS_CLIENT_EMAIL="${GCS_CLIENT_EMAIL:?ERROR: GCS_CLIENT_EMAIL environment variable is required}"
+GCS_PRIVATE_KEY="${GCS_PRIVATE_KEY:?ERROR: GCS_PRIVATE_KEY environment variable is required}"
+GCS_BUCKET_NAME="${GCS_BUCKET_NAME:-chekout-ai}"
+
+# Build env vars string
+ENV_VARS="ENVIRONMENT=${ENVIRONMENT}"
+ENV_VARS="${ENV_VARS},DEBUG=${DEBUG}"
+ENV_VARS="${ENV_VARS},LOG_LEVEL=${LOG_LEVEL}"
+ENV_VARS="${ENV_VARS},GCP_PROJECT_ID=${PROJECT_ID}"
+ENV_VARS="${ENV_VARS},DB_DSN=${DB_DSN}"
+ENV_VARS="${ENV_VARS},GCS_CLIENT_EMAIL=${GCS_CLIENT_EMAIL}"
+ENV_VARS="${ENV_VARS},GCS_PRIVATE_KEY=${GCS_PRIVATE_KEY}"
+ENV_VARS="${ENV_VARS},GCS_BUCKET_NAME=${GCS_BUCKET_NAME}"
+
+# Vertex AI — optional, needed for website-engine creation
+if [ -n "$VERTEX_CLIENT_EMAIL" ]; then
+    ENV_VARS="${ENV_VARS},VERTEX_CLIENT_EMAIL=${VERTEX_CLIENT_EMAIL}"
+fi
+if [ -n "$VERTEX_PRIVATE_KEY" ]; then
+    ENV_VARS="${ENV_VARS},VERTEX_PRIVATE_KEY=${VERTEX_PRIVATE_KEY}"
+fi
+if [ -n "$VERTEX_PROJECT_ID" ]; then
+    ENV_VARS="${ENV_VARS},VERTEX_PROJECT_ID=${VERTEX_PROJECT_ID}"
+fi
+if [ -n "$VERTEX_LOCATION" ]; then
+    ENV_VARS="${ENV_VARS},VERTEX_LOCATION=${VERTEX_LOCATION}"
+fi
+
+# CORS — optional
+if [ -n "$ALLOWED_ORIGINS" ]; then
+    ENV_VARS="${ENV_VARS},ALLOWED_ORIGINS=${ALLOWED_ORIGINS}"
+fi
+
+# =============================================================================
 # Deployment Summary
 # =============================================================================
 
@@ -102,6 +143,10 @@ echo "   Region:         $REGION"
 echo "   Resources:      ${MEMORY} RAM, ${CPU} CPU"
 echo "   Scaling:        ${MIN_INSTANCES}-${MAX_INSTANCES} instances"
 echo "   Log Level:      $LOG_LEVEL"
+echo "   DB_DSN:         ${DB_DSN:0:30}..."
+echo "   GCS_BUCKET:     $GCS_BUCKET_NAME"
+echo "   GCS_EMAIL:      $GCS_CLIENT_EMAIL"
+echo "   VERTEX_EMAIL:   ${VERTEX_CLIENT_EMAIL:-not set}"
 echo ""
 
 # =============================================================================
