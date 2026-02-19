@@ -14,8 +14,9 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system environment variables
 
-from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from handlers.gcs_handler import GCSHandler
@@ -146,7 +147,7 @@ def validate_position(position: str) -> bool:
     Returns:
         True if valid position, False otherwise
     """
-    valid_positions = ['bottom-right', 'bottom-left', 'top-right', 'top-left']
+    valid_positions = ['bottom-right', 'bottom-left', 'top-right', 'top-left', 'bottom-right-raised']
     return position.lower() in valid_positions if position else False
 
 
@@ -310,6 +311,7 @@ class KnowledgeBaseFile(BaseModel):
     file_path: str = Field(..., description="GCS object path (e.g., merchants/my-store/knowledge_base/file.pdf)")
     title: str = Field(..., description="Title for this specific file (e.g., Product Catalog)")
     usage_description: str = Field(..., description="How should your agent use this specific file?")
+    file_type: Optional[str] = Field(None, description="File type: 'products', 'categories', or 'document' (default). Frontend should tag product CSV uploads as 'products'.")
 
 
 class SaveAIPersonaRequest(BaseModel):
@@ -380,7 +382,7 @@ class SaveCustomChatbotRequest(BaseModel):
     font_family: Optional[str] = Field(None, description="Font family (e.g., Inter, sans-serif)", max_length=100)
     color: Optional[str] = Field(None, description="Primary color (hex code, e.g., #667eea)", max_length=20)
     logo_path: Optional[str] = Field(None, description="Logo GCS object path (e.g., merchants/{merchant_id}/brand-images/logo.png). Upload via /files/upload-url first.", max_length=500)
-    position: Optional[str] = Field(None, description="Chatbot position (bottom-right, bottom-left, top-right, top-left)", max_length=20)
+    position: Optional[str] = Field(None, description="Chatbot position (bottom-right, bottom-left, top-right, top-left, bottom-right-raised)", max_length=30)
     
     @field_validator('color')
     @classmethod
@@ -393,7 +395,7 @@ class SaveCustomChatbotRequest(BaseModel):
     @classmethod
     def validate_position_value(cls, v: Optional[str]) -> Optional[str]:
         if v and not validate_position(v):
-            raise ValueError('Invalid position. Must be one of: bottom-right, bottom-left, top-right, top-left')
+            raise ValueError('Invalid position. Must be one of: bottom-right, bottom-left, top-right, top-left, bottom-right-raised')
         return v
     
     @field_validator('logo_path')
@@ -754,21 +756,54 @@ async def process_onboarding(
             raise
 
         # Step 2: Process products
-        # ONLY check knowledge_base folder - no other locations
+        # First check knowledge_base_files metadata (file_type tagged by frontend),
+        # then fall back to filename matching
         products_file_path = None
-        
-        knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+        categories_file_path_tagged = None
+
+        # Load KB file metadata from DB
+        kb_files_metadata = []
         try:
-            files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
-            # Look for products.json, products.csv, or products.xlsx (in that order of preference)
-            for file_path in files_in_kb:
-                filename = file_path.split('/')[-1].lower()
-                if filename in ['products.json', 'products.csv', 'products.xlsx', 'products.xls']:
-                    products_file_path = file_path
-                    logger.info(f"Found products file in knowledge_base: {products_file_path}")
-                    break
+            _conn = get_connection()
+            _cur = _conn.cursor()
+            _cur.execute(
+                "SELECT knowledge_base_files FROM merchants WHERE merchant_id = %s AND user_id = %s",
+                (merchant_id, user_id)
+            )
+            _row = _cur.fetchone()
+            if _row and _row.get("knowledge_base_files"):
+                kb_files_metadata = _row["knowledge_base_files"] if isinstance(_row["knowledge_base_files"], list) else json.loads(_row["knowledge_base_files"])
+            _cur.close()
+            return_connection(_conn)
         except Exception as e:
-            logger.warning(f"Could not scan knowledge_base for products file: {e}")
+            logger.warning(f"Could not load KB file metadata: {e}")
+            if '_conn' in dir():
+                return_connection(_conn)
+
+        # Check file_type tags from metadata
+        for kb_file in kb_files_metadata:
+            ft = (kb_file.get("file_type") or "").lower()
+            fp = kb_file.get("file_path", "")
+            if ft == "products" and fp:
+                products_file_path = fp
+                logger.info(f"Found products file via file_type tag: {products_file_path}")
+            elif ft == "categories" and fp:
+                categories_file_path_tagged = fp
+                logger.info(f"Found categories file via file_type tag: {categories_file_path_tagged}")
+
+        # Fallback: scan knowledge_base folder by filename
+        if not products_file_path:
+            knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+            try:
+                files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+                for file_path in files_in_kb:
+                    filename = file_path.split('/')[-1].lower()
+                    if filename in ['products.json', 'products.csv', 'products.xlsx', 'products.xls']:
+                        products_file_path = file_path
+                        logger.info(f"Found products file by filename: {products_file_path}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not scan knowledge_base for products file: {e}")
         
         if products_file_path:
             status_tracker.update_step_status(
@@ -812,21 +847,21 @@ async def process_onboarding(
             )
 
         # Step 2b: Process categories
-        # ONLY check knowledge_base folder - no other locations
-        categories_file_path = None
-        
-        knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
-        try:
-            files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
-            # Look for categories.csv or categories.xlsx
-            for file_path in files_in_kb:
-                filename = file_path.split('/')[-1].lower()
-                if filename in ['categories.csv', 'categories.xlsx', 'categories.xls']:
-                    categories_file_path = file_path
-                    logger.info(f"Found categories file in knowledge_base: {categories_file_path}")
-                    break
-        except Exception as e:
-            logger.warning(f"Could not scan knowledge_base for categories file: {e}")
+        # Use tagged file first, fall back to filename matching
+        categories_file_path = categories_file_path_tagged
+
+        if not categories_file_path:
+            knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+            try:
+                files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+                for file_path in files_in_kb:
+                    filename = file_path.split('/')[-1].lower()
+                    if filename in ['categories.csv', 'categories.xlsx', 'categories.xls']:
+                        categories_file_path = file_path
+                        logger.info(f"Found categories file by filename: {categories_file_path}")
+                        break
+            except Exception as e:
+                logger.warning(f"Could not scan knowledge_base for categories file: {e}")
         
         if categories_file_path:
             status_tracker.update_step_status(
@@ -1187,17 +1222,30 @@ async def process_agent_update(
         # Step 1: Re-process products if requested and file exists
         if update_products:
             products_file_path = None
-            knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
-            try:
-                files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
-                for file_path in files_in_kb:
-                    filename = file_path.split('/')[-1].lower()
-                    if filename in ['products.json', 'products.csv', 'products.xlsx', 'products.xls']:
-                        products_file_path = file_path
-                        logger.info(f"Found products file for update: {products_file_path}")
-                        break
-            except Exception as e:
-                logger.warning(f"Could not scan knowledge_base for products file: {e}")
+
+            # Check file_type tags from KB metadata
+            kb_files_meta = merchant.get("knowledge_base_files") or []
+            if isinstance(kb_files_meta, str):
+                kb_files_meta = json.loads(kb_files_meta)
+            for kb_file in kb_files_meta:
+                if (kb_file.get("file_type") or "").lower() == "products" and kb_file.get("file_path"):
+                    products_file_path = kb_file["file_path"]
+                    logger.info(f"Found products file via file_type tag for update: {products_file_path}")
+                    break
+
+            # Fallback: scan by filename
+            if not products_file_path:
+                knowledge_base_prefix = f"merchants/{merchant_id}/knowledge_base/"
+                try:
+                    files_in_kb = gcs_handler.list_files(knowledge_base_prefix)
+                    for file_path in files_in_kb:
+                        filename = file_path.split('/')[-1].lower()
+                        if filename in ['products.json', 'products.csv', 'products.xlsx', 'products.xls']:
+                            products_file_path = file_path
+                            logger.info(f"Found products file by filename for update: {products_file_path}")
+                            break
+                except Exception as e:
+                    logger.warning(f"Could not scan knowledge_base for products file: {e}")
             
             if products_file_path:
                 status_tracker.update_step_status(
@@ -1895,7 +1943,8 @@ async def save_knowledge_base(request: SaveKnowledgeBaseRequest):
             {
                 "file_path": file.file_path,
                 "title": file.title,
-                "usage_description": file.usage_description
+                "usage_description": file.usage_description,
+                "file_type": file.file_type or "document"
             }
             for file in request.files
         ]
@@ -2360,41 +2409,60 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
             preserve_existing=True
         )
         
-        # Update database with logo_url if provided
-        if logo_url:
-            conn = None
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                
+        # Update database with all chatbot fields
+        conn = None
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+
+            # Build dynamic SET clause for only provided fields
+            db_updates = {}
+            if request.title is not None:
+                db_updates["chatbot_title"] = request.title
+            if request.tag_line is not None:
+                db_updates["chatbot_tag_line"] = request.tag_line
+            if request.font_family is not None:
+                db_updates["chatbot_font_family"] = request.font_family
+            if request.color is not None:
+                db_updates["chatbot_color"] = f"#{request.color.lstrip('#')}"
+            if request.position is not None:
+                db_updates["chatbot_position"] = request.position.lower()
+            if logo_url:
+                db_updates["chatbot_logo_signed_url"] = logo_url
+                db_updates["logo_url"] = logo_url
+
+            if db_updates:
+                set_clauses = [f"{col} = %s" for col in db_updates.keys()]
+                set_clauses.append("updated_at = NOW()")
+                values = list(db_updates.values()) + [request.merchant_id, request.user_id]
+
                 cursor.execute(
-                    """UPDATE merchants 
-                       SET logo_url = %s,
-                           updated_at = NOW()
+                    f"""UPDATE merchants
+                       SET {', '.join(set_clauses)}
                        WHERE merchant_id = %s AND user_id = %s
                        RETURNING merchant_id""",
-                    (logo_url, request.merchant_id, request.user_id)
+                    values
                 )
-                
+
                 result = cursor.fetchone()
                 if not result:
                     raise HTTPException(status_code=404, detail="Merchant not found or access denied")
-                
+
                 conn.commit()
                 cursor.close()
-                
-                logger.info(f"Updated logo_url in database for merchant: {request.merchant_id}")
-                
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Error updating logo_url in database: {e}")
-                if conn:
-                    conn.rollback()
-                # Don't fail the entire request if database update fails - config was already updated
-            finally:
-                if conn:
-                    return_connection(conn)
+
+                logger.info(f"Updated chatbot config in database for merchant: {request.merchant_id} (fields: {list(db_updates.keys())})")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating chatbot config in database: {e}")
+            if conn:
+                conn.rollback()
+            # Don't fail the entire request if database update fails - config was already updated
+        finally:
+            if conn:
+                return_connection(conn)
         
         logger.info(f"Saved custom chatbot configuration for merchant: {request.merchant_id}")
         
@@ -3125,6 +3193,104 @@ async def get_onboarding_status(merchant_id: str):
     except Exception as e:
         logger.error(f"Error getting status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/onboard-status/{merchant_id}/stream")
+async def stream_onboarding_status(merchant_id: str, request: Request):
+    """
+    SSE (Server-Sent Events) endpoint for real-time onboarding progress.
+
+    The frontend connects once and receives events as each step completes.
+    Events are pushed automatically — no polling needed.
+
+    Event format (each line):
+        data: {"step": "process_products", "step_status": "completed", "message": "...", "progress": 37, "job_status": "in_progress", "timestamp": "..."}
+
+    Terminal events (connection closes after):
+        job_status = "completed" or "failed"
+
+    Frontend usage:
+        const es = new EventSource('/onboard-status/my-merchant/stream');
+        es.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            updateProgressBar(data.progress);
+            updateStepStatus(data.step, data.step_status);
+            if (data.job_status === 'completed' || data.job_status === 'failed') {
+                es.close();
+            }
+        };
+
+    Notes:
+        - If the job already completed before the client connects, a single
+          "completed" or "failed" event is sent immediately and the stream closes.
+        - Keep the polling endpoint GET /onboard-status/{merchant_id} as fallback
+          for reconnection and non-browser clients.
+    """
+    import asyncio
+
+    # Check if job exists; if already done, send final status and close
+    current = status_tracker.get_status(merchant_id)
+    current_status_str = str(current.get("status", "")) if current else ""
+    if current and current_status_str in ("completed", "failed"):
+        async def _done():
+            event = {
+                "step": "finalize",
+                "step_status": current_status_str,
+                "message": current.get("error") or "Onboarding completed",
+                "error": current.get("error"),
+                "progress": current.get("progress", 100),
+                "job_status": current_status_str,
+                "current_step": current.get("current_step"),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            yield f"data: {json.dumps(event)}\n\n"
+        return StreamingResponse(_done(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+
+    # Subscribe to live events
+    queue = status_tracker.subscribe(merchant_id)
+
+    async def event_generator():
+        try:
+            # Send initial snapshot so client knows current state
+            if current:
+                snapshot = {
+                    "step": current.get("current_step") or "create_merchant_record",
+                    "step_status": "in_progress",
+                    "message": "Connected — streaming live updates",
+                    "error": None,
+                    "progress": current.get("progress", 0),
+                    "job_status": str(current.get("status", "pending")),
+                    "current_step": current.get("current_step"),
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+                yield f"data: {json.dumps(snapshot)}\n\n"
+
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    # Wait for next event (timeout to check disconnect)
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+
+                    # Close stream on terminal events
+                    if event.get("job_status") in ("completed", "failed"):
+                        break
+                except asyncio.TimeoutError:
+                    # Send heartbeat to keep connection alive
+                    yield f": heartbeat\n\n"
+        finally:
+            status_tracker.unsubscribe(merchant_id, queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # Disable Nginx buffering if behind proxy
+    })
 
 
 # Merchant Management Endpoints

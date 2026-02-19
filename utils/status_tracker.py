@@ -1,7 +1,9 @@
-"""Status tracking utility for onboarding jobs"""
+"""Status tracking utility for onboarding jobs with SSE support"""
 
+import asyncio
+import json
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 from enum import Enum
 
@@ -27,11 +29,13 @@ class StepStatus(str, Enum):
 
 
 class StatusTracker:
-    """Track onboarding job status and progress"""
+    """Track onboarding job status and progress with SSE event support"""
 
     def __init__(self):
         """Initialize status tracker"""
         self._jobs: Dict[str, Dict] = {}
+        # SSE subscribers: merchant_id -> list of asyncio.Queue
+        self._sse_subscribers: Dict[str, List[asyncio.Queue]] = {}
 
     def create_job(self, merchant_id: str, user_id: str) -> str:
         """
@@ -83,6 +87,13 @@ class StatusTracker:
                     "completed_at": None,
                     "error": None
                 },
+                "import_products_db": {
+                    "status": StepStatus.PENDING,
+                    "message": "Importing products to database with embeddings",
+                    "started_at": None,
+                    "completed_at": None,
+                    "error": None
+                },
                 "convert_documents": {
                     "status": StepStatus.PENDING,
                     "message": "Converting documents to NDJSON",
@@ -129,7 +140,7 @@ class StatusTracker:
         error: Optional[str] = None
     ):
         """
-        Update status of a specific step
+        Update status of a specific step and notify SSE subscribers.
 
         Args:
             merchant_id: Merchant identifier
@@ -145,8 +156,14 @@ class StatusTracker:
         job = self._jobs[merchant_id]
 
         if step_name not in job["steps"]:
-            logger.warning(f"Step not found: {step_name}")
-            return
+            # Step not in predefined list — create it dynamically
+            job["steps"][step_name] = {
+                "status": StepStatus.PENDING,
+                "message": step_name,
+                "started_at": None,
+                "completed_at": None,
+                "error": None
+            }
 
         step = job["steps"][step_name]
         step["status"] = status
@@ -185,6 +202,58 @@ class StatusTracker:
         job["updated_at"] = datetime.utcnow().isoformat()
         logger.info(f"Updated step {step_name} for merchant {merchant_id}: {status}")
 
+        # Push SSE event to all subscribers for this merchant
+        self._push_sse_event(merchant_id, {
+            "step": step_name,
+            "step_status": status.value,
+            "message": message or step.get("message", ""),
+            "error": error,
+            "progress": job["progress"],
+            "job_status": job["status"].value,
+            "current_step": job["current_step"],
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+    def _push_sse_event(self, merchant_id: str, event: dict):
+        """Push event to all SSE subscribers for a merchant (thread-safe)."""
+        subscribers = self._sse_subscribers.get(merchant_id, [])
+        if not subscribers:
+            return
+
+        # Remove dead queues and push to active ones
+        active = []
+        for queue in subscribers:
+            try:
+                queue.put_nowait(event)
+                active.append(queue)
+            except Exception:
+                # Queue full or closed — drop it
+                pass
+        self._sse_subscribers[merchant_id] = active
+
+    def subscribe(self, merchant_id: str) -> asyncio.Queue:
+        """
+        Subscribe to SSE events for a merchant.
+        Returns an asyncio.Queue that receives events.
+        """
+        queue = asyncio.Queue(maxsize=100)
+        if merchant_id not in self._sse_subscribers:
+            self._sse_subscribers[merchant_id] = []
+        self._sse_subscribers[merchant_id].append(queue)
+        logger.info(f"SSE subscriber added for merchant {merchant_id} (total: {len(self._sse_subscribers[merchant_id])})")
+        return queue
+
+    def unsubscribe(self, merchant_id: str, queue: asyncio.Queue):
+        """Remove an SSE subscriber."""
+        subscribers = self._sse_subscribers.get(merchant_id, [])
+        try:
+            subscribers.remove(queue)
+        except ValueError:
+            pass
+        if not subscribers:
+            self._sse_subscribers.pop(merchant_id, None)
+        logger.info(f"SSE subscriber removed for merchant {merchant_id}")
+
     def get_status(self, merchant_id: str) -> Optional[Dict]:
         """
         Get current status of a job
@@ -206,4 +275,3 @@ class StatusTracker:
         if merchant_id in self._jobs:
             del self._jobs[merchant_id]
             logger.info(f"Deleted job for merchant: {merchant_id}")
-
