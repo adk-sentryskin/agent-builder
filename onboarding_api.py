@@ -383,7 +383,11 @@ class SaveCustomChatbotRequest(BaseModel):
     color: Optional[str] = Field(None, description="Primary color (hex code, e.g., #667eea)", max_length=20)
     logo_path: Optional[str] = Field(None, description="Logo GCS object path (e.g., merchants/{merchant_id}/brand-images/logo.png). Upload via /files/upload-url first.", max_length=500)
     position: Optional[str] = Field(None, description="Chatbot position (bottom-right, bottom-left, top-right, top-left, bottom-right-raised)", max_length=30)
-    
+    helper_text: Optional[str] = Field(None, description="CTA text on collapsed widget bubble (e.g., 'Need help?')", max_length=200)
+    favicon_path: Optional[str] = Field(None, description="Favicon GCS path or URL. Upload via /files/upload-url first.", max_length=500)
+    chat_avatar_path: Optional[str] = Field(None, description="Chat avatar GCS path or URL. Upload via /files/upload-url first.", max_length=500)
+    ga_measurement_id: Optional[str] = Field(None, description="Google Analytics measurement ID (e.g., 'G-XXXXXXXXXX')", max_length=30)
+
     @field_validator('color')
     @classmethod
     def validate_color_format(cls, v: Optional[str]) -> Optional[str]:
@@ -2259,6 +2263,73 @@ async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _resolve_image_path(image_path: str, merchant_id: str, field_name: str = "Image") -> str:
+    """
+    Resolve a GCS path or URL to a public URL.
+    Same logic as logo_path handling — validates merchant ownership, prevents path traversal,
+    converts GCS paths to public URLs, and passes through existing URLs.
+
+    Args:
+        image_path: GCS object path, gs:// URL, or https:// URL
+        merchant_id: Merchant ID for ownership validation
+        field_name: Human-readable name for error messages
+
+    Returns:
+        Public URL string
+
+    Raises:
+        HTTPException on validation failure
+    """
+    expected_prefix = f"merchants/{merchant_id}/"
+    actual_path = image_path
+
+    # Already a full URL — accept it directly
+    if image_path.startswith(('http://', 'https://')):
+        if 'storage.cloud.google.com' in image_path or 'storage.googleapis.com' in image_path:
+            # GCS URL — extract path to validate merchant ownership
+            full_path = image_path.split('storage.cloud.google.com/')[-1] if 'storage.cloud.google.com' in image_path else image_path.split('storage.googleapis.com/')[-1]
+            path_parts = full_path.split('/', 1)
+            if len(path_parts) == 2:
+                actual_path = path_parts[1]
+            else:
+                return image_path
+        else:
+            # External URL — allow
+            logger.info(f"External {field_name} URL for merchant {merchant_id}: {image_path[:50]}...")
+            return image_path
+
+    # gs:// URL — extract path
+    if image_path.startswith('gs://'):
+        parts = image_path.replace('gs://', '').split('/', 1)
+        if len(parts) != 2:
+            raise HTTPException(status_code=400, detail=f"Invalid gs:// URL format for {field_name}")
+        actual_path = parts[1]
+
+    # Validate merchant ownership
+    if not actual_path.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{field_name} path must belong to merchant {merchant_id}. Path must start with '{expected_prefix}'"
+        )
+    if '..' in actual_path or actual_path.startswith('/'):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} path: path traversal and absolute paths are not allowed"
+        )
+
+    # Convert to public GCS URL
+    if image_path.startswith('gs://'):
+        parts = image_path.replace('gs://', '').split('/', 1)
+        if len(parts) == 2:
+            bucket, path = parts
+            return f"https://storage.cloud.google.com/{bucket}/{path}"
+    elif image_path.startswith(('http://', 'https://')):
+        return image_path
+
+    # Relative GCS path
+    return f"https://storage.cloud.google.com/{gcs_handler.bucket_name}/{image_path}"
+
+
 @app.post("/agents/custom-chatbot")
 async def save_custom_chatbot(request: SaveCustomChatbotRequest):
     """
@@ -2394,7 +2465,27 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
                     logo_url = f"https://storage.cloud.google.com/{gcs_handler.bucket_name}/{request.logo_path}"
                 
                 custom_chatbot_updates["logo_signed_url"] = logo_url
-        
+
+        # Handle helper_text
+        if request.helper_text is not None:
+            custom_chatbot_updates["helper_text"] = request.helper_text
+
+        # Handle ga_measurement_id
+        if request.ga_measurement_id is not None:
+            custom_chatbot_updates["ga_measurement_id"] = request.ga_measurement_id
+
+        # Handle favicon_path — same pattern as logo_path
+        favicon_url = None
+        if request.favicon_path:
+            favicon_url = _resolve_image_path(request.favicon_path, request.merchant_id, "Favicon")
+            custom_chatbot_updates["favicon_signed_url"] = favicon_url
+
+        # Handle chat_avatar_path — same pattern as logo_path
+        chat_avatar_url = None
+        if request.chat_avatar_path:
+            chat_avatar_url = _resolve_image_path(request.chat_avatar_path, request.merchant_id, "Chat avatar")
+            custom_chatbot_updates["chat_avatar_signed_url"] = chat_avatar_url
+
         # Only update if there are changes
         if not custom_chatbot_updates:
             raise HTTPException(
@@ -2430,6 +2521,14 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
             if logo_url:
                 db_updates["chatbot_logo_signed_url"] = logo_url
                 db_updates["logo_url"] = logo_url
+            if request.helper_text is not None:
+                db_updates["chatbot_helper_text"] = request.helper_text
+            if favicon_url:
+                db_updates["chatbot_favicon_signed_url"] = favicon_url
+            if chat_avatar_url:
+                db_updates["chatbot_avatar_signed_url"] = chat_avatar_url
+            if request.ga_measurement_id is not None:
+                db_updates["ga_measurement_id"] = request.ga_measurement_id
 
             if db_updates:
                 set_clauses = [f"{col} = %s" for col in db_updates.keys()]
@@ -3452,7 +3551,11 @@ async def get_merchant_info(merchant_id: str, user_id: str):
             "chatbot_font_family": merchant.get('chatbot_font_family'),
             "chatbot_tag_line": merchant.get('chatbot_tag_line'),
             "chatbot_position": merchant.get('chatbot_position'),
-            
+            "chatbot_helper_text": merchant.get('chatbot_helper_text'),
+            "chatbot_favicon_signed_url": merchant.get('chatbot_favicon_signed_url'),
+            "chatbot_avatar_signed_url": merchant.get('chatbot_avatar_signed_url'),
+            "ga_measurement_id": merchant.get('ga_measurement_id'),
+
             # Status fields
             "status": merchant.get('status'),
             "onboarding_status": merchant.get('onboarding_status'),
@@ -3571,7 +3674,11 @@ async def list_merchants(user_id: str, status: Optional[str] = None):
                 "chatbot_font_family": merchant.get('chatbot_font_family'),
                 "chatbot_tag_line": merchant.get('chatbot_tag_line'),
                 "chatbot_position": merchant.get('chatbot_position'),
-                
+                "chatbot_helper_text": merchant.get('chatbot_helper_text'),
+                "chatbot_favicon_signed_url": merchant.get('chatbot_favicon_signed_url'),
+                "chatbot_avatar_signed_url": merchant.get('chatbot_avatar_signed_url'),
+                "ga_measurement_id": merchant.get('ga_measurement_id'),
+
                 # Status fields
                 "status": merchant.get('status'),
                 "onboarding_status": merchant.get('onboarding_status'),
