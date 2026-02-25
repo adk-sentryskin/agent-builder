@@ -14,10 +14,13 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system environment variables
 
-from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query, Request
+from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 
 from handlers.gcs_handler import GCSHandler
 from handlers.product_processor import ProductProcessor
@@ -68,6 +71,17 @@ async def lifespan(app: FastAPI):
         config_generator = ConfigGenerator(gcs_handler)
         product_importer = ProductImporter(gcs_handler)
         logger.info("All handlers initialized successfully")
+
+        # Initialize Firebase Admin SDK
+        if not firebase_admin._apps:
+            sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if sa_path:
+                cred = credentials.Certificate(sa_path)
+                firebase_admin.initialize_app(cred)
+            else:
+                # Cloud Run: uses Application Default Credentials from service account
+                firebase_admin.initialize_app()
+            logger.info("Firebase Admin SDK initialized")
     except Exception as e:
         logger.error(f"Failed to initialize handlers: {e}")
         raise
@@ -95,6 +109,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def verify_firebase_token(authorization: str = Header(...)) -> str:
+    """Verify Firebase JWT from Authorization header and return the uid."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.split(" ", 1)[1]
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+        return decoded["uid"]
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
 
 
 # Request/Response Models
@@ -1607,7 +1635,7 @@ async def get_upload_url(
     content_type: str = Form(...),
     folder: str = Form(...),
     merchant_id: str = Form(...),
-    user_id: str = Form(...),
+    uid: str = Depends(verify_firebase_token),
     expiration_minutes: int = Form(60)
 ):
     """
@@ -1622,6 +1650,7 @@ async def get_upload_url(
     Note: File uploads are allowed without subscription (for draft/saving purposes).
     Subscription is checked when creating the agent.
     """
+    user_id = uid
     try:
         # Verify user owns merchant_id
         if not verify_merchant_access(merchant_id, user_id):
@@ -1661,7 +1690,7 @@ async def get_upload_url(
 @app.post("/files/upload-urls")
 async def get_bulk_upload_urls(
     merchant_id: str = Form(...),
-    user_id: str = Form(...),
+    uid: str = Depends(verify_firebase_token),
     files: str = Form(...)
 ):
     """
@@ -1678,6 +1707,7 @@ async def get_bulk_upload_urls(
     
     Security: Verifies user owns merchant_id before generating upload URLs.
     """
+    user_id = uid
     try:
         # Verify user owns merchant_id
         if not verify_merchant_access(merchant_id, user_id):
@@ -1734,7 +1764,7 @@ async def get_bulk_upload_urls(
 
 
 @app.post("/files/confirm")
-async def confirm_upload(object_path: str = Form(...)):
+async def confirm_upload(object_path: str = Form(...), uid: str = Depends(verify_firebase_token)):
     """Confirm file upload was successful"""
     try:
         result = gcs_handler.confirm_upload(object_path)
@@ -1747,7 +1777,7 @@ async def confirm_upload(object_path: str = Form(...)):
 
 
 @app.post("/agents/ai-persona")
-async def save_ai_persona(request: SaveAIPersonaRequest):
+async def save_ai_persona(request: SaveAIPersonaRequest, uid: str = Depends(verify_firebase_token)):
     """
     Save AI Persona (Step 1) - Build Your Own AI Agent
     
@@ -1772,6 +1802,8 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
     - status: "saved" or "updated"
     - ai_persona_saved: true
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Generate merchant_id from store_name if not provided
         merchant_id = request.get_merchant_id()
@@ -1914,7 +1946,7 @@ async def save_ai_persona(request: SaveAIPersonaRequest):
 
 
 @app.post("/agents/knowledge-base")
-async def save_knowledge_base(request: SaveKnowledgeBaseRequest):
+async def save_knowledge_base(request: SaveKnowledgeBaseRequest, uid: str = Depends(verify_firebase_token)):
     """
     Save Knowledge Base (Step 2) - Per-file knowledge base information
     
@@ -1936,6 +1968,8 @@ async def save_knowledge_base(request: SaveKnowledgeBaseRequest):
     - knowledge_base_saved: true
     - files_count: Number of files saved
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Verify merchant access
         if not verify_merchant_access(request.merchant_id, request.user_id):
@@ -2007,7 +2041,7 @@ async def save_knowledge_base(request: SaveKnowledgeBaseRequest):
 
 
 @app.put("/agents/knowledge-base")
-async def update_knowledge_base(request: SaveKnowledgeBaseRequest):
+async def update_knowledge_base(request: SaveKnowledgeBaseRequest, uid: str = Depends(verify_firebase_token)):
     """
     Update Knowledge Base (Step 2 - Edit mode)
     
@@ -2017,7 +2051,7 @@ async def update_knowledge_base(request: SaveKnowledgeBaseRequest):
     Note: This replaces ALL existing files. To update specific files, use PATCH endpoint.
     To keep existing files, include them in the files array.
     """
-    return await save_knowledge_base(request)
+    return await save_knowledge_base(request, uid)
 
 
 class UpdateKnowledgeBaseFileRequest(BaseModel):
@@ -2030,7 +2064,7 @@ class UpdateKnowledgeBaseFileRequest(BaseModel):
 
 
 @app.patch("/agents/knowledge-base/file")
-async def update_knowledge_base_file(request: UpdateKnowledgeBaseFileRequest):
+async def update_knowledge_base_file(request: UpdateKnowledgeBaseFileRequest, uid: str = Depends(verify_firebase_token)):
     """
     Update a single knowledge base file's metadata (title and/or usage_description)
     
@@ -2046,11 +2080,13 @@ async def update_knowledge_base_file(request: UpdateKnowledgeBaseFileRequest):
     Returns:
         Updated file information
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Verify merchant access
         if not verify_merchant_access(request.merchant_id, request.user_id):
             raise HTTPException(status_code=403, detail="Access denied")
-        
+
         # Get current knowledge base files
         merchant = get_merchant(request.merchant_id, request.user_id)
         if not merchant:
@@ -2148,7 +2184,7 @@ class DeleteKnowledgeBaseFileRequest(BaseModel):
 
 
 @app.delete("/agents/knowledge-base/file")
-async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
+async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest, uid: str = Depends(verify_firebase_token)):
     """
     Delete a single knowledge base file
     
@@ -2165,11 +2201,13 @@ async def delete_knowledge_base_file(request: DeleteKnowledgeBaseFileRequest):
     Returns:
         Deletion status
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Verify merchant access
         if not verify_merchant_access(request.merchant_id, request.user_id):
             raise HTTPException(status_code=403, detail="Access denied")
-        
+
         # Get current knowledge base files
         merchant = get_merchant(request.merchant_id, request.user_id)
         if not merchant:
@@ -2331,7 +2369,7 @@ def _resolve_image_path(image_path: str, merchant_id: str, field_name: str = "Im
 
 
 @app.post("/agents/custom-chatbot")
-async def save_custom_chatbot(request: SaveCustomChatbotRequest):
+async def save_custom_chatbot(request: SaveCustomChatbotRequest, uid: str = Depends(verify_firebase_token)):
     """
     Save Custom Chatbot Configuration (Step 4) - Chatbot UI customization
     
@@ -2371,6 +2409,8 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
     - custom_chatbot_saved: true
     - config: Updated merchant_config.json content
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Verify merchant access
         if not verify_merchant_access(request.merchant_id, request.user_id):
@@ -2588,20 +2628,21 @@ async def save_custom_chatbot(request: SaveCustomChatbotRequest):
 
 
 @app.put("/agents/custom-chatbot")
-async def update_custom_chatbot(request: SaveCustomChatbotRequest):
+async def update_custom_chatbot(request: SaveCustomChatbotRequest, uid: str = Depends(verify_firebase_token)):
     """
     Update Custom Chatbot Configuration (Step 4 - Edit mode)
-    
+
     This is an alias for POST /agents/custom-chatbot.
     Updates existing custom chatbot configuration.
     """
-    return await save_custom_chatbot(request)
+    return await save_custom_chatbot(request, uid)
 
 
 @app.post("/agents/create")
 async def create_agent(
     request: CreateAgentRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Create Agent (Step 3) - Trigger onboarding with all collected data
@@ -2625,6 +2666,8 @@ async def create_agent(
     - status: "started" or "validation_failed"
     - missing_fields: list of missing required fields (if validation fails)
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Check if user has active subscription
         if not check_subscription(request.user_id):
@@ -2738,7 +2781,8 @@ async def create_agent(
 @app.post("/agents/update")
 async def update_agent(
     request: UpdateAgentRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Update Agent - Re-process knowledge base after changes
@@ -2770,6 +2814,8 @@ async def update_agent(
     Returns:
         job_id, merchant_id, status, status_url
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Check if user has active subscription
         if not check_subscription(request.user_id):
@@ -2948,7 +2994,8 @@ async def process_agent_deletion(
 @app.delete("/agents/delete")
 async def delete_agent(
     request: DeleteAgentRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Delete Agent - Remove agent and all associated data
@@ -2969,6 +3016,8 @@ async def delete_agent(
     Returns:
         merchant_id, status, message
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Verify merchant exists and belongs to user
         merchant = get_merchant(request.merchant_id, request.user_id)
@@ -3001,7 +3050,8 @@ async def delete_agent(
 @app.post("/onboard")
 async def start_onboarding(
     request: OnboardRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Start merchant onboarding process
@@ -3011,6 +3061,8 @@ async def start_onboarding(
     
     Note: Requires active subscription to start onboarding.
     """
+    if request.user_id != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         # Check if user has active subscription
         if not check_subscription(request.user_id):
@@ -3059,7 +3111,7 @@ async def start_onboarding(
 
 
 @app.get("/onboard-status/{merchant_id}")
-async def get_onboarding_status(merchant_id: str):
+async def get_onboarding_status(merchant_id: str, uid: str = Depends(verify_firebase_token)):
     """
     Get onboarding progress status
     
@@ -3295,7 +3347,7 @@ async def get_onboarding_status(merchant_id: str):
 
 
 @app.get("/onboard-status/{merchant_id}/stream")
-async def stream_onboarding_status(merchant_id: str, request: Request):
+async def stream_onboarding_status(merchant_id: str, request: Request, uid: str = Depends(verify_firebase_token)):
     """
     SSE (Server-Sent Events) endpoint for real-time onboarding progress.
 
@@ -3412,7 +3464,7 @@ class UpdateMerchantRequest(BaseModel):
 
 
 @app.get("/merchants/{merchant_id}")
-async def get_merchant_info(merchant_id: str, user_id: str):
+async def get_merchant_info(merchant_id: str, uid: str = Depends(verify_firebase_token)):
     """
     Get merchant/agent information with document details
     
@@ -3427,6 +3479,7 @@ async def get_merchant_info(merchant_id: str, user_id: str):
         merchant_id: Merchant identifier
         user_id: User identifier (query parameter for security)
     """
+    user_id = uid
     try:
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
@@ -3606,7 +3659,7 @@ async def get_merchant_info(merchant_id: str, user_id: str):
 
 
 @app.get("/merchants")
-async def list_merchants(user_id: str, status: Optional[str] = None):
+async def list_merchants(uid: str = Depends(verify_firebase_token), status: Optional[str] = None):
     """
     List all merchants/agents for a user (Active Merchants/Agents)
     
@@ -3620,6 +3673,7 @@ async def list_merchants(user_id: str, status: Optional[str] = None):
         user_id: User identifier (query parameter)
         status: Optional filter by status (active, draft, onboarding, error)
     """
+    user_id = uid
     try:
         # Use optimized function that gets connection status in a single query
         merchants = get_user_merchants_with_connection_status(user_id)
@@ -3713,18 +3767,18 @@ async def list_merchants(user_id: str, status: Optional[str] = None):
 
 
 @app.get("/agents")
-async def list_agents(user_id: str):
+async def list_agents(uid: str = Depends(verify_firebase_token)):
     """
     List all active agents for a user (alias for /merchants)
-    
+
     This endpoint returns the same data as /merchants but is named
     "agents" to match frontend terminology.
     """
-    return await list_merchants(user_id, status=None)
+    return await list_merchants(uid, status=None)
 
 
 @app.get("/agents/{merchant_id}/knowledge-base")
-async def get_knowledge_base(merchant_id: str, user_id: str):
+async def get_knowledge_base(merchant_id: str, uid: str = Depends(verify_firebase_token)):
     """
     Get Knowledge Base information for an agent with download URLs
     
@@ -3736,11 +3790,12 @@ async def get_knowledge_base(merchant_id: str, user_id: str):
         merchant_id: Merchant/Agent identifier
         user_id: User identifier (query parameter for security)
     """
+    user_id = uid
     try:
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found or access denied")
-        
+
         # Get knowledge base files from JSONB column
         import json
         knowledge_base_files = []
@@ -3793,7 +3848,7 @@ async def get_knowledge_base(merchant_id: str, user_id: str):
 @app.get("/merchants/{merchant_id}/config")
 async def get_merchant_config(
     merchant_id: str,
-    user_id: Optional[str] = Query(default=None, description="User identifier (optional)")
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Get merchant_config.json content
@@ -3826,18 +3881,13 @@ async def get_merchant_config(
     }
     ```
     """
+    user_id = uid
     try:
-        # Get config path - if user_id provided, verify ownership; otherwise use default path
-        config_path = None
-        if user_id:
-            # Verify merchant ownership when user_id is provided
-            merchant = get_merchant(merchant_id, user_id)
-            if not merchant:
-                raise HTTPException(status_code=404, detail="Merchant not found or access denied")
-            config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
-        else:
-            # If user_id not provided, use default config path (public access)
-            config_path = f"merchants/{merchant_id}/merchant_config.json"
+        # Verify merchant ownership
+        merchant = get_merchant(merchant_id, user_id)
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+        config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
         
         # Download and parse config
         try:
@@ -3918,7 +3968,7 @@ async def get_merchant_config(
 async def update_merchant_config(
     merchant_id: str,
     updates: Dict[str, Any],
-    user_id: str
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Update merchant_config.json by merging provided fields with existing config
@@ -3981,11 +4031,12 @@ async def update_merchant_config(
     ```
     """
     try:
+        user_id = uid
         # Verify merchant access
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found or access denied")
-        
+
         # IMPORTANT: This endpoint ONLY updates the config file
         # It does NOT trigger onboarding or any other processes
         # Update config (always preserve existing, merge new fields)
@@ -4016,7 +4067,7 @@ async def update_merchant_config(
 async def update_merchant_info(
     merchant_id: str,
     request: UpdateMerchantRequest,
-    user_id: str
+    uid: str = Depends(verify_firebase_token)
 ):
     """
     Update merchant information
@@ -4043,6 +4094,7 @@ async def update_merchant_info(
         user_id: User identifier (query parameter for security)
     """
     try:
+        user_id = uid
         # Get current merchant data before update (needed for config regeneration)
         current_merchant = get_merchant(merchant_id, user_id)
         if not current_merchant:
@@ -4156,7 +4208,7 @@ async def update_merchant_info(
 
 
 @app.delete("/merchants/{merchant_id}")
-async def delete_merchant_info(merchant_id: str, user_id: str):
+async def delete_merchant_info(merchant_id: str, uid: str = Depends(verify_firebase_token)):
     """
     Delete merchant and all associated data
     
@@ -4171,6 +4223,7 @@ async def delete_merchant_info(merchant_id: str, user_id: str):
         user_id: User identifier (query parameter for security)
     """
     try:
+        user_id = uid
         # Verify access first
         if not verify_merchant_access(merchant_id, user_id):
             raise HTTPException(
