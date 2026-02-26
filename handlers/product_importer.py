@@ -150,16 +150,26 @@ class ProductImporter:
 
         if platform == "shopify":
             domain = shop_url.replace("https://", "").replace("http://", "").rstrip("/")
+            # Handle both unique constraints: shop_domain AND merchant_id.
+            # ON CONFLICT (shop_domain): when the same domain is reused (e.g. test merchants),
+            # update merchant_id to the current merchant so the store row is claimed.
+            # A separate ON CONFLICT (merchant_id) clause handles the case where merchant_id
+            # already has a store row with a different domain — update domain to the new one.
+            # We use a two-step approach: upsert on shop_domain, then fetch by shop_domain.
             cursor.execute(
                 """INSERT INTO shopify_sync.shopify_stores (merchant_id, shop_domain, is_active)
                    VALUES (%s, %s, 1)
-                   ON CONFLICT (merchant_id) DO NOTHING""",
+                   ON CONFLICT (shop_domain) DO UPDATE
+                     SET merchant_id = EXCLUDED.merchant_id, is_active = 1""",
                 (merchant_id, domain),
             )
             cursor.execute(
-                "SELECT id FROM shopify_sync.shopify_stores WHERE merchant_id = %s", (merchant_id,)
+                "SELECT id FROM shopify_sync.shopify_stores WHERE shop_domain = %s", (domain,)
             )
-            return cursor.fetchone()["id"] if hasattr(cursor.fetchone, "__getitem__") else self._fetch_id(cursor, merchant_id, "shopify_sync.shopify_stores")
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Failed to create or fetch shopify store for domain {domain}")
+            return row["id"] if isinstance(row, dict) else row[0]
 
         elif platform == "woocommerce":
             cursor.execute(
@@ -173,7 +183,10 @@ class ProductImporter:
                 "SELECT id FROM woocommerce_sync.woocommerce_stores WHERE merchant_id = %s",
                 (merchant_id,),
             )
-            return cursor.fetchone()[0]
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Failed to create or fetch woocommerce store for merchant {merchant_id}")
+            return row["id"] if isinstance(row, dict) else row[0]
 
         elif platform == "squarespace":
             cursor.execute(
@@ -187,7 +200,10 @@ class ProductImporter:
                 "SELECT id FROM squarespace_sync.squarespace_stores WHERE merchant_id = %s",
                 (merchant_id,),
             )
-            return cursor.fetchone()[0]
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"Failed to create or fetch squarespace store for merchant {merchant_id}")
+            return row["id"] if isinstance(row, dict) else row[0]
 
         raise ValueError(f"Unknown platform: {platform}")
 
