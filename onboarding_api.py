@@ -30,7 +30,8 @@ from handlers.config_generator import ConfigGenerator
 from handlers.product_importer import ProductImporter
 from utils.status_tracker import StatusTracker, StepStatus
 from utils.db_helpers import (
-    get_merchant, create_merchant, update_merchant, delete_merchant,
+    get_merchant, get_merchant_including_deleted, create_merchant, update_merchant, delete_merchant,
+    soft_delete_merchant, restore_merchant,
     get_user_merchants, get_user_merchants_with_connection_status,
     verify_merchant_access, update_merchant_onboarding_step,
     check_subscription, get_connection, return_connection, get_crm_integrations
@@ -1088,26 +1089,10 @@ async def process_onboarding(
             except Exception as db_err:
                 logger.warning(f"Failed to update vertex_datastore_id in database: {db_err}")
             
-            if import_errors:
-                # Check if it's a permission error
-                has_permission_error = any("IAM_PERMISSION_DENIED" in err or "Permission" in err for err in import_errors)
-                if has_permission_error:
-                    message += f". Import failed due to missing permissions. Run ./grant_vertex_permissions.sh to fix."
-                    logger.warning(f"Vertex AI import failed due to permissions. Errors: {import_errors}")
-                else:
-                    message += f". Import errors: {len(import_errors)} file(s) failed"
-                    logger.warning(f"Vertex AI import had errors: {import_errors}")
-                
-                # Don't fail the entire onboarding - mark as completed with warnings
-                status_tracker.update_step_status(
-                    merchant_id, "setup_vertex", StepStatus.COMPLETED,
-                    message=message
-                )
-            else:
-                status_tracker.update_step_status(
-                    merchant_id, "setup_vertex", StepStatus.COMPLETED,
-                    message=message
-                )
+            status_tracker.update_step_status(
+                merchant_id, "setup_vertex", StepStatus.COMPLETED,
+                message=message
+            )
         except Exception as e:
             error_msg = str(e)
             # Check if it's a permission error
@@ -1834,15 +1819,10 @@ async def save_ai_persona(request: SaveAIPersonaRequest, uid: str = Depends(veri
         if not success:
             raise HTTPException(status_code=500, detail="Failed to save AI Persona")
 
-        # For Shopify only: require CRM connection to mark Step 1 complete. Other platforms: mark without checking.
-        platform_lower = (request.platform or "").strip().lower()
-        if platform_lower == "shopify":
-            is_connected = get_crm_integrations(merchant_id)
-            should_mark_saved = is_connected
-            if not is_connected:
-                logger.info(f"Merchant {merchant_id} (Shopify) does not have CRM integration connected - ai_persona_saved not updated")
-        else:
-            should_mark_saved = True
+        # Always mark ai_persona_saved when form is submitted.
+        # is_connected (whether products are synced) is tracked separately and shown in the UI,
+        # but should not block saving the persona — new users connect their store after agent creation.
+        should_mark_saved = True
 
         if should_mark_saved:
             conn = None
@@ -2762,7 +2742,7 @@ async def create_agent(
         # Start onboarding (returns immediately, processes in background)
         logger.info(f"🚀 Starting async onboarding for merchant {request.merchant_id} - should return immediately")
         start_time = datetime.utcnow()
-        result = await start_onboarding(onboard_request, background_tasks)
+        result = await start_onboarding(onboard_request, background_tasks, uid)
         elapsed = (datetime.utcnow() - start_time).total_seconds()
         logger.info(f"✅ start_onboarding returned in {elapsed:.2f} seconds for merchant {request.merchant_id}")
         
@@ -2998,23 +2978,9 @@ async def delete_agent(
     uid: str = Depends(verify_firebase_token)
 ):
     """
-    Delete Agent - Remove agent and all associated data
-    
-    This endpoint ALWAYS permanently deletes everything (unconditional):
-    1. Vertex AI datastores (website and docs datastores)
-    2. GCS files (entire merchant folder with all files)
-    3. Database record (merchant and all related data via CASCADE)
-    4. Status tracking data
-    
-    ⚠️ WARNING: This operation is IRREVERSIBLE. All agent data will be permanently deleted.
-    There are no options to skip deletion of any component - everything is always deleted.
-    
-    Args:
-        merchant_id: Merchant identifier
-        user_id: User identifier (for verification)
-    
-    Returns:
-        merchant_id, status, message
+    Soft-delete an agent — immediately marks the merchant as deleted in the DB
+    (so it disappears on re-login), then schedules GCS/Vertex cleanup in background.
+    The merchant data is preserved so it can be restored via POST /merchants/{id}/restore.
     """
     if request.user_id != uid:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -3023,27 +2989,99 @@ async def delete_agent(
         merchant = get_merchant(request.merchant_id, request.user_id)
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found or access denied")
-        
-        # Start background deletion process (always deletes everything)
-        background_tasks.add_task(
-            process_agent_deletion,
-            merchant_id=request.merchant_id,
-            user_id=request.user_id
-        )
-        
-        logger.info(f"Started agent deletion for merchant {request.merchant_id}")
-        
+
+        # Soft-delete synchronously — this persists immediately to DB regardless of
+        # what happens to background tasks (fixes Cloud Run background task kill issue)
+        deleted = soft_delete_merchant(request.merchant_id, request.user_id)
+        if not deleted:
+            raise HTTPException(status_code=500, detail="Failed to delete agent")
+
+        logger.info(f"Soft-deleted merchant {request.merchant_id} for user {request.user_id}")
+
         return {
             "merchant_id": request.merchant_id,
-            "status": "deletion_started",
-            "message": "Agent deletion started. This will permanently delete all agent data including Vertex AI datastores, GCS files, and database records.",
-            "warning": "This operation is irreversible. All agent data will be permanently deleted."
+            "status": "deleted",
+            "message": "Agent deleted successfully. You can restore it at any time.",
+            "restorable": True
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error starting agent deletion: {e}")
+        logger.error(f"Error deleting agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/merchants/deleted")
+async def list_deleted_merchants(uid: str = Depends(verify_firebase_token)):
+    """
+    List all soft-deleted merchants for the current user.
+    Frontend can use this to show a 'Recently deleted' section with restore buttons.
+    """
+    try:
+        conn = None
+        from utils.db_helpers import get_connection, return_connection
+        from psycopg2.extras import RealDictCursor
+        try:
+            conn = get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                """
+                SELECT merchant_id, shop_name, bot_name, platform, deleted_at, agent_created
+                FROM merchants
+                WHERE user_id = %s AND is_deleted = TRUE
+                ORDER BY deleted_at DESC
+                """,
+                (uid,)
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            merchants = []
+            for r in rows:
+                d = dict(r)
+                if d.get('deleted_at'):
+                    d['deleted_at'] = d['deleted_at'].isoformat()
+                merchants.append(d)
+        finally:
+            if conn:
+                return_connection(conn)
+
+        return {"deleted_merchants": merchants, "count": len(merchants)}
+
+    except Exception as e:
+        logger.error(f"Error listing deleted merchants: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/merchants/{merchant_id}/restore")
+async def restore_agent(merchant_id: str, uid: str = Depends(verify_firebase_token)):
+    """
+    Restore a soft-deleted merchant using the Firebase token for user identification.
+    Since soft delete preserves all data (GCS files, embeddings, Vertex datastores),
+    the agent is fully functional after restore — no re-onboarding needed.
+    """
+    try:
+        restored = restore_merchant(merchant_id, uid)
+        if not restored:
+            raise HTTPException(
+                status_code=404,
+                detail="Merchant not found in deleted state or does not belong to this user"
+            )
+
+        merchant = get_merchant(merchant_id, uid)
+        logger.info(f"Restored merchant {merchant_id} for user {uid}")
+
+        return {
+            "merchant_id": merchant_id,
+            "status": "restored",
+            "message": "Agent restored successfully.",
+            "merchant": merchant
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error restoring agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3483,13 +3521,27 @@ async def get_merchant_info(merchant_id: str, uid: str = Depends(verify_firebase
     try:
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
+            # Check if it exists but is soft-deleted — return 410 with restore info
+            deleted_merchant = get_merchant_including_deleted(merchant_id, user_id)
+            if deleted_merchant and deleted_merchant.get('is_deleted'):
+                return JSONResponse(
+                    status_code=410,
+                    content={
+                        "status": "deleted",
+                        "merchant_id": merchant_id,
+                        "deleted_at": deleted_merchant.get('deleted_at').isoformat() if deleted_merchant.get('deleted_at') else None,
+                        "restorable": True,
+                        "message": "This agent has been deleted. You can restore it."
+                    }
+                )
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail="Merchant not found or you don't have access"
             )
         
         # Add flow status
-        # Check if merchant is connected to Shopify
+        # is_connected = True if merchant has products via any method (OAuth sync OR CSV import)
+        # get_crm_integrations checks actual product tables, not the unreliable product_count column
         is_connected = get_crm_integrations(merchant_id)
 
         merchant['flow_status'] = {
@@ -4231,28 +4283,22 @@ async def delete_merchant_info(merchant_id: str, uid: str = Depends(verify_fireb
                 detail="Merchant not found or you don't have access"
             )
         
-        # Delete from database (cascade will handle related records)
-        success = delete_merchant(merchant_id, user_id)
-        
+        # Soft-delete synchronously so it persists immediately
+        success = soft_delete_merchant(merchant_id, user_id)
+
         if not success:
             raise HTTPException(
                 status_code=404,
                 detail="Merchant not found or you don't have access"
             )
-        
-        # TODO: Optionally delete GCS files
-        # merchant_prefix = f"merchants/{merchant_id}/"
-        # gcs_handler.delete_folder(merchant_prefix)
-        
-        # TODO: Optionally delete Vertex AI datastore
-        # vertex_setup.delete_datastore(merchant_id)
-        
-        logger.warning(f"Merchant {merchant_id} deleted by user {user_id}")
-        
+
+        logger.info(f"Soft-deleted merchant {merchant_id} by user {user_id}")
+
         return {
             "merchant_id": merchant_id,
             "status": "deleted",
-            "message": "Merchant and associated data deleted successfully"
+            "message": "Merchant deleted successfully. You can restore it at any time.",
+            "restorable": True
         }
     
     except HTTPException:

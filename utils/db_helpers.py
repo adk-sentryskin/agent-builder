@@ -67,17 +67,19 @@ def get_merchant(merchant_id: str, user_id: Optional[str] = None) -> Optional[Di
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # Merchants table in public schema
+        # Merchants table in public schema — exclude soft-deleted records
         if user_id:
             query = """
                 SELECT * FROM merchants
                 WHERE merchant_id = %s AND user_id = %s
+                  AND (is_deleted = FALSE OR is_deleted IS NULL)
             """
             cursor.execute(query, (merchant_id, user_id))
         else:
             query = """
                 SELECT * FROM merchants
                 WHERE merchant_id = %s
+                  AND (is_deleted = FALSE OR is_deleted IS NULL)
             """
             cursor.execute(query, (merchant_id,))
         
@@ -91,6 +93,30 @@ def get_merchant(merchant_id: str, user_id: Optional[str] = None) -> Optional[Di
         return None
     except Exception as e:
         logger.error(f"Error getting merchant: {e}")
+        return None
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def get_merchant_including_deleted(merchant_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get a merchant record regardless of soft-delete status.
+    Used to distinguish between 'deleted' and 'never existed'.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(
+            "SELECT * FROM merchants WHERE merchant_id = %s AND user_id = %s",
+            (merchant_id, user_id)
+        )
+        result = cursor.fetchone()
+        cursor.close()
+        return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Error getting merchant (including deleted): {e}")
         return None
     finally:
         if conn:
@@ -309,51 +335,47 @@ def update_merchant_onboarding_step(
 
 def get_crm_integrations(merchant_id: str) -> bool:
     """
-    Check if merchant is connected to Shopify by verifying access token exists
+    Returns True if merchant has products loaded via any method:
+    - Shopify OAuth (access_token exists in shopify_stores)
+    - Shopify CSV import (products exist in shopify_sync.products)
+    - WooCommerce products (products exist in woocommerce_sync.products)
+    - Squarespace products (products exist in squarespace_sync.squarespace_products)
 
-    Args:
-        merchant_id: Merchant identifier
-
-    Returns:
-        True if merchant has valid Shopify access token, False otherwise
+    The merchants.product_count column is unreliable (not always updated by pipeline),
+    so we query the actual product tables directly.
     """
     conn = None
     try:
         conn = get_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor()
 
-        # Query shopify_stores table in shopify_sync schema to check if access token exists
-        query = """
-            SELECT access_token
-            FROM shopify_sync.shopify_stores
-            WHERE merchant_id = %s
-        """
+        # Check Shopify OAuth token first (fastest path)
+        cursor.execute(
+            "SELECT access_token FROM shopify_sync.shopify_stores WHERE merchant_id = %s",
+            (merchant_id,)
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            cursor.close()
+            return True
 
-        cursor.execute(query, (merchant_id,))
-        result = cursor.fetchone()
+        # Check actual product counts across all platform tables
+        cursor.execute("""
+            SELECT (
+                SELECT COUNT(*) FROM shopify_sync.products WHERE merchant_id = %s
+            ) + (
+                SELECT COUNT(*) FROM woocommerce_sync.products WHERE merchant_id = %s
+            ) + (
+                SELECT COUNT(*) FROM squarespace_sync.squarespace_products WHERE merchant_id = %s
+            ) AS total
+        """, (merchant_id, merchant_id, merchant_id))
+        total = cursor.fetchone()[0] or 0
         cursor.close()
 
-        # Debug logging
-        logger.info(f"[is_connected] merchant_id: {merchant_id}")
-        logger.info(f"[is_connected] Query result: {result}")
-        if result:
-            access_token = result.get('access_token')
-            logger.info(f"[is_connected] access_token exists: {access_token is not None}")
-            logger.info(f"[is_connected] access_token length: {len(access_token) if access_token else 0}")
-            logger.info(f"[is_connected] access_token empty check: {bool(access_token)}")
-        else:
-            logger.info(f"[is_connected] No record found in shopify_sync.shopify_stores")
-
-        # Check if merchant exists and has access_token
-        if result and result.get('access_token'):
-            logger.info(f"[is_connected] Returning TRUE for merchant: {merchant_id}")
-            return True
-        else:
-            logger.info(f"[is_connected] Returning FALSE for merchant: {merchant_id}")
-            return False
+        return total > 0
 
     except Exception as e:
-        logger.error(f"Error checking Shopify connection: {e}")
+        logger.error(f"Error checking product connection status: {e}")
         return False
     finally:
         if conn:
@@ -648,6 +670,7 @@ def get_user_merchants(user_id: str) -> list:
         query = """
             SELECT * FROM merchants
             WHERE user_id = %s
+              AND (is_deleted = FALSE OR is_deleted IS NULL)
             ORDER BY updated_at DESC
         """
 
@@ -692,6 +715,7 @@ def get_user_merchants_with_connection_status(user_id: str) -> list:
             FROM merchants m
             LEFT JOIN shopify_sync.shopify_stores sm ON m.merchant_id = sm.merchant_id
             WHERE m.user_id = %s
+              AND (m.is_deleted = FALSE OR m.is_deleted IS NULL)
             ORDER BY m.updated_at DESC
         """
 
@@ -894,4 +918,102 @@ def delete_merchant(merchant_id: str, user_id: str) -> bool:
     finally:
         if conn:
             return_connection(conn)
+
+
+
+def soft_delete_merchant(merchant_id: str, user_id: str) -> bool:
+    """
+    Soft-delete a merchant — marks is_deleted=TRUE and sets deleted_at.
+    The merchant record, GCS files, embeddings, and Vertex datastores are preserved
+    so the merchant can be fully restored later.
+    """
+    conn = None
+    try:
+        if not verify_merchant_access(merchant_id, user_id):
+            logger.warning(f"User {user_id} does not have access to merchant {merchant_id}")
+            return False
+
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE merchants
+            SET is_deleted = TRUE,
+                deleted_at = NOW(),
+                updated_at = NOW()
+            WHERE merchant_id = %s AND user_id = %s
+              AND (is_deleted = FALSE OR is_deleted IS NULL)
+            """,
+            (merchant_id, user_id)
+        )
+        rows_updated = cursor.rowcount
+        conn.commit()
+        cursor.close()
+
+        if rows_updated > 0:
+            logger.info(f"Soft-deleted merchant {merchant_id} for user {user_id}")
+            return True
+        else:
+            logger.warning(f"Merchant {merchant_id} not found, not owned by {user_id}, or already deleted")
+            return False
+
+    except psycopg2.Error as e:
+        logger.error(f"Database error soft-deleting merchant: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    except Exception as e:
+        logger.error(f"Error soft-deleting merchant: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_connection(conn)
+
+
+def restore_merchant(merchant_id: str, user_id: str) -> bool:
+    """
+    Restore a soft-deleted merchant — clears is_deleted and deleted_at.
+    Since data is preserved on soft delete, the merchant is fully restored.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE merchants
+            SET is_deleted = FALSE,
+                deleted_at = NULL,
+                updated_at = NOW()
+            WHERE merchant_id = %s AND user_id = %s AND is_deleted = TRUE
+            """,
+            (merchant_id, user_id)
+        )
+        rows_updated = cursor.rowcount
+        conn.commit()
+        cursor.close()
+
+        if rows_updated > 0:
+            logger.info(f"Restored merchant {merchant_id} for user {user_id}")
+            return True
+        else:
+            logger.warning(f"Merchant {merchant_id} not found in deleted state for user {user_id}")
+            return False
+
+    except psycopg2.Error as e:
+        logger.error(f"Database error restoring merchant: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    except Exception as e:
+        logger.error(f"Error restoring merchant: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_connection(conn)
+
 
