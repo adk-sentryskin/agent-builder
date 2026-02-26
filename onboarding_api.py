@@ -16,7 +16,7 @@ except ImportError:
 
 from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 import firebase_admin
@@ -28,7 +28,7 @@ from handlers.document_converter import DocumentConverter
 from handlers.vertex_setup import VertexSetup
 from handlers.config_generator import ConfigGenerator
 from handlers.product_importer import ProductImporter
-from utils.status_tracker import StatusTracker, StepStatus
+from utils.status_tracker import StatusTracker, StepStatus, JobStatus
 from utils.db_helpers import (
     get_merchant, get_merchant_including_deleted, create_merchant, update_merchant, delete_merchant,
     soft_delete_merchant, restore_merchant,
@@ -1076,7 +1076,6 @@ async def process_onboarding(
             
             # Also update vertex_datastore_id and status in database
             try:
-                from utils.db_helpers import get_connection, return_connection
                 conn = get_connection()
                 cursor = conn.cursor()
                 cursor.execute(
@@ -1117,6 +1116,8 @@ async def process_onboarding(
             merchant_id, "generate_config", StepStatus.IN_PROGRESS
         )
         try:
+            # Fetch full merchant record to get custom_chatbot fields (avatar, favicon, etc.)
+            merchant_data = get_merchant(merchant_id, user_id) or {}
             config_result = config_generator.generate_config(
                 user_id=user_id,
                 merchant_id=merchant_id,
@@ -1133,7 +1134,11 @@ async def process_onboarding(
                 secondary_color=secondary_color,
                 logo_url=logo_url,
                 platform=platform,
-                custom_url_pattern=custom_url_pattern
+                custom_url_pattern=custom_url_pattern,
+                avatar_url=merchant_data.get('chatbot_avatar_signed_url'),
+                favicon_url=merchant_data.get('chatbot_favicon_signed_url'),
+                helper_text=merchant_data.get('chatbot_helper_text'),
+                ga_measurement_id=merchant_data.get('ga_measurement_id'),
             )
             # Update database with config generation results
             config_path = config_result.get('config_path', f"merchants/{merchant_id}/merchant_config.json")
@@ -1429,23 +1434,23 @@ async def process_agent_update(
         # Mark update as completed
         status = status_tracker.get_status(merchant_id)
         if status:
-            status["status"] = "completed"
+            status["status"] = JobStatus.COMPLETED
             status["current_step"] = None
             status["message"] = "Agent update completed successfully"
             status["progress"] = 100
             status["updated_at"] = datetime.utcnow().isoformat()
-        
+
         logger.info(f"Agent update completed for merchant: {merchant_id}")
-    
+
     except Exception as e:
         logger.error(f"Error in agent update process for merchant {merchant_id}: {e}")
         import traceback
         logger.debug(traceback.format_exc())
-        
+
         # Mark job as failed
         status = status_tracker.get_status(merchant_id)
         if status:
-            status["status"] = "failed"
+            status["status"] = JobStatus.FAILED
             status["error"] = str(e)
             status["updated_at"] = datetime.utcnow().isoformat()
         
@@ -1894,7 +1899,11 @@ async def save_ai_persona(request: SaveAIPersonaRequest, uid: str = Depends(veri
                         secondary_color=merchant_data.get('secondary_color', "#764ba2"),
                         logo_url=merchant_data.get('logo_url'),
                         platform=merchant_data.get('platform') or getattr(request, 'platform', None),
-                        custom_url_pattern=merchant_data.get('custom_url_pattern') or getattr(request, 'custom_url_pattern', None)
+                        custom_url_pattern=merchant_data.get('custom_url_pattern') or getattr(request, 'custom_url_pattern', None),
+                        avatar_url=merchant_data.get('chatbot_avatar_signed_url'),
+                        favicon_url=merchant_data.get('chatbot_favicon_signed_url'),
+                        helper_text=merchant_data.get('chatbot_helper_text'),
+                        ga_measurement_id=merchant_data.get('ga_measurement_id'),
                     )
                     config_updated = True
                     logger.info(f"✅ Updated merchant_config.json for merchant: {merchant_id}")
@@ -2974,13 +2983,12 @@ async def process_agent_deletion(
 @app.delete("/agents/delete")
 async def delete_agent(
     request: DeleteAgentRequest,
-    background_tasks: BackgroundTasks,
     uid: str = Depends(verify_firebase_token)
 ):
     """
-    Soft-delete an agent — immediately marks the merchant as deleted in the DB
-    (so it disappears on re-login), then schedules GCS/Vertex cleanup in background.
-    The merchant data is preserved so it can be restored via POST /merchants/{id}/restore.
+    Soft-delete an agent — marks the merchant as deleted in the DB so it disappears
+    from the merchant list. All data (GCS files, embeddings, Vertex datastores) is
+    preserved and the merchant can be fully restored via POST /merchants/{id}/restore.
     """
     if request.user_id != uid:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -3898,18 +3906,14 @@ async def get_knowledge_base(merchant_id: str, uid: str = Depends(verify_firebas
 
 
 @app.get("/merchants/{merchant_id}/config")
-async def get_merchant_config(
-    merchant_id: str,
-    uid: str = Depends(verify_firebase_token)
-):
+async def get_merchant_config(merchant_id: str):
     """
-    Get merchant_config.json content
-    
+    Get merchant_config.json content (no auth required).
+
     Returns the full merchant configuration including custom_chatbot fields.
-    
+
     Args:
         merchant_id: Merchant identifier
-        user_id: User identifier (optional query parameter - if provided, verifies ownership)
     
     Response:
     ```json
@@ -3933,21 +3937,19 @@ async def get_merchant_config(
     }
     ```
     """
-    user_id = uid
     try:
-        # Verify merchant ownership
-        merchant = get_merchant(merchant_id, user_id)
+        merchant = get_merchant(merchant_id, user_id=None)
         if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            raise HTTPException(status_code=404, detail="Merchant not found")
         config_path = merchant.get("config_path") or f"merchants/{merchant_id}/merchant_config.json"
-        
+
         # Download and parse config
         try:
             file_content = gcs_handler.download_file(config_path)
             config = json.loads(file_content.decode('utf-8'))
-            
+
             # Always merge platform and custom_url_pattern from DB (DB is source of truth)
-            merchant_for_platform = get_merchant(merchant_id, user_id) if user_id else get_merchant(merchant_id, user_id=None)
+            merchant_for_platform = get_merchant(merchant_id, user_id=None)
             if merchant_for_platform:
                 db_platform = merchant_for_platform.get("platform")
                 if db_platform:
@@ -4017,16 +4019,12 @@ async def get_merchant_config(
 
 
 @app.patch("/merchants/{merchant_id}/config")
-async def update_merchant_config(
-    merchant_id: str,
-    updates: Dict[str, Any],
-    uid: str = Depends(verify_firebase_token)
-):
+async def update_merchant_config(merchant_id: str, updates: Dict[str, Any]):
     """
-    Update merchant_config.json by merging provided fields with existing config
-    
+    Update merchant_config.json by merging provided fields with existing config (no auth required).
+
     ⚠️ CRITICAL: This endpoint ONLY updates the merchant_config.json file in GCS.
-    
+
     It does NOT:
     - ❌ Trigger onboarding process
     - ❌ Re-process products
@@ -4054,8 +4052,7 @@ async def update_merchant_config(
     Args:
         merchant_id: Merchant identifier
         updates: JSON object with fields to update/add (can be nested)
-        user_id: User identifier (query parameter for security)
-    
+
     Example Request (update existing + add new):
     ```json
     {
@@ -4083,11 +4080,9 @@ async def update_merchant_config(
     ```
     """
     try:
-        user_id = uid
-        # Verify merchant access
-        merchant = get_merchant(merchant_id, user_id)
+        merchant = get_merchant(merchant_id, user_id=None)
         if not merchant:
-            raise HTTPException(status_code=404, detail="Merchant not found or access denied")
+            raise HTTPException(status_code=404, detail="Merchant not found")
 
         # IMPORTANT: This endpoint ONLY updates the config file
         # It does NOT trigger onboarding or any other processes
@@ -4228,7 +4223,11 @@ async def update_merchant_info(
                     secondary_color=updated_merchant.get('secondary_color', '#764ba2'),
                     logo_url=updated_merchant.get('logo_url'),
                     platform=updated_merchant.get('platform'),
-                    custom_url_pattern=updated_merchant.get('custom_url_pattern')
+                    custom_url_pattern=updated_merchant.get('custom_url_pattern'),
+                    avatar_url=updated_merchant.get('chatbot_avatar_signed_url'),
+                    favicon_url=updated_merchant.get('chatbot_favicon_signed_url'),
+                    helper_text=updated_merchant.get('chatbot_helper_text'),
+                    ga_measurement_id=updated_merchant.get('ga_measurement_id'),
                 )
                 
                 logger.info(f"Config regenerated for merchant {merchant_id} after field updates: {[f for f in updates.keys() if f in config_relevant_fields]}")

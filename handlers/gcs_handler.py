@@ -174,26 +174,26 @@ class GCSHandler:
         object_path = f"merchants/{merchant_id}/{folder}/{filename}"
 
         try:
-            # Check if credentials are available and have private key
-            if not hasattr(self.client, '_credentials'):
-                logger.warning("Storage client does not have credentials attribute")
-            else:
-                creds = self.client._credentials
-                if hasattr(creds, 'private_key'):
-                    has_key = creds.private_key is not None
-                    logger.debug(f"Credentials have private_key: {has_key}")
-                else:
-                    logger.warning("Credentials object does not have private_key attribute")
-            
-            # Generate signed URL
-            blob = self.bucket.blob(object_path)
+            # For signed URLs we need either credentials with private_key or IAM signBlob.
+            # When using ADC (e.g. Cloud Run workload identity), credentials have no private_key;
+            # pass service_account_email so the client can use IAM signBlob (requires
+            # roles/iam.serviceAccountTokenCreator on that SA).
+            creds = getattr(self.client, "_credentials", None)
+            sign_kwargs = {
+                "version": "v4",
+                "expiration": timedelta(minutes=expiration_minutes),
+                "method": "PUT",
+                "content_type": content_type,
+            }
+            if creds is None or not getattr(creds, "private_key", None):
+                sa_email = os.getenv("GCS_CLIENT_EMAIL")
+                if sa_email:
+                    sign_kwargs["service_account_email"] = sa_email
+                    logger.debug("Using IAM signBlob for signed URL (no private_key in credentials)")
+                # else: will rely on default credentials; generate_signed_url may raise
 
-            url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(minutes=expiration_minutes),
-                method="PUT",
-                content_type=content_type,
-            )
+            blob = self.bucket.blob(object_path)
+            url = blob.generate_signed_url(**sign_kwargs)
 
             logger.info(f"Generated signed URL for: {object_path}")
 
@@ -295,13 +295,19 @@ class GCSHandler:
                     return base_response
                 # For other errors, continue to try generating URL
             
-            # Try to generate signed URL
+            # Try to generate signed URL (use IAM signBlob when credentials have no private_key)
             try:
-                url = blob.generate_signed_url(
-                    version="v4",
-                    expiration=timedelta(minutes=expiration_minutes),
-                    method="GET"
-                )
+                sign_kwargs = {
+                    "version": "v4",
+                    "expiration": timedelta(minutes=expiration_minutes),
+                    "method": "GET",
+                }
+                creds = getattr(self.client, "_credentials", None)
+                if creds is None or not getattr(creds, "private_key", None):
+                    sa_email = os.getenv("GCS_CLIENT_EMAIL")
+                    if sa_email:
+                        sign_kwargs["service_account_email"] = sa_email
+                url = blob.generate_signed_url(**sign_kwargs)
                 logger.info(f"Generated download URL for: {object_path}")
                 
                 base_response["download_url"] = url

@@ -40,7 +40,11 @@ class ConfigGenerator:
         secondary_color: Optional[str] = "#764ba2",
         logo_url: Optional[str] = None,
         platform: Optional[str] = None,
-        custom_url_pattern: Optional[str] = None
+        custom_url_pattern: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+        favicon_url: Optional[str] = None,
+        helper_text: Optional[str] = None,
+        ga_measurement_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate merchant configuration JSON
@@ -138,10 +142,14 @@ class ConfigGenerator:
                     # Preserve existing custom_chatbot settings if they exist, otherwise use defaults
                     "title": existing_custom_chatbot.get("title", bot_name or "AI Assistant"),
                     "logo_signed_url": existing_custom_chatbot.get("logo_signed_url", full_logo_url or ""),
+                    "avatar_url": avatar_url or existing_custom_chatbot.get("avatar_url", ""),
+                    "favicon_url": favicon_url or existing_custom_chatbot.get("favicon_url", ""),
                     "color": existing_custom_chatbot.get("color", primary_color or "#667eea"),
                     "font_family": existing_custom_chatbot.get("font_family", "Inter, sans-serif"),
                     "tag_line": existing_custom_chatbot.get("tag_line", ""),
-                    "position": existing_custom_chatbot.get("position", "bottom-right")
+                    "helper_text": helper_text or existing_custom_chatbot.get("helper_text", ""),
+                    "position": existing_custom_chatbot.get("position", "bottom-right"),
+                    "ga_measurement_id": ga_measurement_id or existing_custom_chatbot.get("ga_measurement_id", ""),
                 },
                 "metadata": {
                     # Preserve created_at from existing config if it exists

@@ -17,7 +17,7 @@ def get_db_pool():
     """Get or create database connection pool"""
     global _db_pool
     if _db_pool is None:
-        db_dsn = os.getenv("DB_DSN")
+        db_dsn = (os.getenv("DB_DSN") or "").strip()
         if not db_dsn:
             raise ValueError("DB_DSN environment variable not set")
         
