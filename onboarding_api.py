@@ -15,6 +15,7 @@ except ImportError:
     pass  # python-dotenv not installed, use system environment variables
 
 from fastapi import FastAPI, HTTPException, Form, BackgroundTasks, Query, Request, Depends, Header
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -36,6 +37,7 @@ from utils.db_helpers import (
     verify_merchant_access, update_merchant_onboarding_step,
     check_subscription, get_connection, return_connection, get_crm_integrations
 )
+from psycopg2.extras import RealDictCursor
 
 # Configure logging (console only - production logs go to Cloud Logging/stdout)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -100,6 +102,12 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"422 Validation error on {request.method} {request.url.path}: {exc.errors()}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 # CORS middleware
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -798,7 +806,7 @@ async def process_onboarding(
         kb_files_metadata = []
         try:
             _conn = get_connection()
-            _cur = _conn.cursor()
+            _cur = _conn.cursor(cursor_factory=RealDictCursor)
             _cur.execute(
                 "SELECT knowledge_base_files FROM merchants WHERE merchant_id = %s AND user_id = %s",
                 (merchant_id, user_id)
@@ -1217,15 +1225,15 @@ async def process_agent_update(
             logger.error(f"Merchant not found: {merchant_id}")
             status = status_tracker.get_status(merchant_id)
             if status:
-                status["status"] = "failed"
+                status["status"] = JobStatus.FAILED
                 status["error"] = f"Merchant not found: {merchant_id}"
                 status["updated_at"] = datetime.utcnow().isoformat()
             return
-        
+
         # Mark job as in progress for update
         status = status_tracker.get_status(merchant_id)
         if status:
-            status["status"] = "in_progress"
+            status["status"] = JobStatus.IN_PROGRESS
             status["current_step"] = "update_agent"
             status["message"] = "Agent update in progress..."
             status["updated_at"] = datetime.utcnow().isoformat()
@@ -3028,8 +3036,6 @@ async def list_deleted_merchants(uid: str = Depends(verify_firebase_token)):
     """
     try:
         conn = None
-        from utils.db_helpers import get_connection, return_connection
-        from psycopg2.extras import RealDictCursor
         try:
             conn = get_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -3393,7 +3399,7 @@ async def get_onboarding_status(merchant_id: str, uid: str = Depends(verify_fire
 
 
 @app.get("/onboard-status/{merchant_id}/stream")
-async def stream_onboarding_status(merchant_id: str, request: Request, uid: str = Depends(verify_firebase_token)):
+async def stream_onboarding_status(merchant_id: str, request: Request):
     """
     SSE (Server-Sent Events) endpoint for real-time onboarding progress.
 
