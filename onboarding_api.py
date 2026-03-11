@@ -31,8 +31,7 @@ from handlers.config_generator import ConfigGenerator
 from handlers.product_importer import ProductImporter
 from utils.status_tracker import StatusTracker, StepStatus, JobStatus
 from utils.db_helpers import (
-    get_merchant, get_merchant_including_deleted, create_merchant, update_merchant, delete_merchant,
-    soft_delete_merchant, restore_merchant,
+    get_merchant, create_merchant, update_merchant, delete_merchant,
     get_user_merchants, get_user_merchants_with_connection_status,
     verify_merchant_access, update_merchant_onboarding_step,
     check_subscription, get_connection, return_connection, get_crm_integrations
@@ -966,6 +965,35 @@ async def process_onboarding(
                     error=str(e)
                 )
                 # Don't raise — products.json is still available for prompt context
+        else:
+            # Check if products already exist via OAuth sync
+            _product_count = 0
+            try:
+                _pc_conn = get_connection()
+                _pc_cur = _pc_conn.cursor()
+                if platform and platform.strip().lower() == 'shopify':
+                    _pc_cur.execute("SELECT COUNT(*) FROM shopify_sync.products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
+                elif platform and platform.strip().lower() == 'woocommerce':
+                    _pc_cur.execute("SELECT COUNT(*) FROM woocommerce_sync.products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
+                elif platform and platform.strip().lower() == 'squarespace':
+                    _pc_cur.execute("SELECT COUNT(*) FROM squarespace_sync.squarespace_products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
+                _product_count = (_pc_cur.fetchone() or [0])[0]
+                _pc_cur.close()
+                return_connection(_pc_conn)
+            except Exception:
+                if '_pc_conn' in dir():
+                    return_connection(_pc_conn)
+
+            if _product_count > 0:
+                status_tracker.update_step_status(
+                    merchant_id, "import_products_db", StepStatus.SKIPPED,
+                    message=f"Products already synced via OAuth ({_product_count} products in DB)"
+                )
+            else:
+                status_tracker.update_step_status(
+                    merchant_id, "import_products_db", StepStatus.SKIPPED,
+                    message="No products file uploaded and no products synced via OAuth"
+                )
 
         # Step 3: Convert documents
         # ONLY check knowledge_base folder - collect all files except products.csv and categories.csv
@@ -1073,8 +1101,9 @@ async def process_onboarding(
                 message += f" with website crawling for {shop_url}"
             
             # Update database with Vertex setup results
-            vertex_datastore_id = datastore_result.get('datastore_id', f"{merchant_id}-engine")
-            vertex_status = 'active' if datastore_result.get('status') in ['created', 'exists'] else 'error'
+            website_ds_result = datastore_result.get('website_datastore') or {}
+            vertex_datastore_id = website_ds_result.get('datastore_id', f"{merchant_id}-website-engine")
+            vertex_status = 'active' if website_ds_result.get('status') in ['created', 'exists'] else 'error'
             
             update_merchant_onboarding_step(
                 merchant_id=merchant_id,
@@ -1156,6 +1185,28 @@ async def process_onboarding(
                 completed=True,
                 file_paths={'config_path': config_path}
             )
+
+            # Write BigQuery config to DB — these columns are read by the chatbot at runtime.
+            # config_generator writes them to GCS but the DB columns must also be set.
+            try:
+                bq_project = os.getenv("GCP_PROJECT_ID", "production-aibuilder")
+                _bq_conn = get_connection()
+                _bq_cursor = _bq_conn.cursor()
+                _bq_cursor.execute("""
+                    UPDATE merchants
+                    SET bigquery_project_id = %s,
+                        bigquery_dataset_id = %s,
+                        bigquery_table_id   = %s,
+                        updated_at          = NOW()
+                    WHERE merchant_id = %s
+                """, (bq_project, "chatbot_logs", "conversations", merchant_id))
+                _bq_conn.commit()
+                _bq_cursor.close()
+                return_connection(_bq_conn)
+                logger.info(f"Set BigQuery config in DB for {merchant_id}: project={bq_project}")
+            except Exception as bq_err:
+                logger.warning(f"Failed to set BigQuery config in DB for {merchant_id}: {bq_err}")
+
             status_tracker.update_step_status(
                 merchant_id, "generate_config", StepStatus.COMPLETED,
                 message="Configuration generated successfully"
@@ -2688,15 +2739,10 @@ async def create_agent(
                 detail="AI Persona (Step 1) not saved. Please complete Step 1 first."
             )
         
+        # Knowledge base is optional — if not saved, onboarding will skip document processing
         if not merchant.get('knowledge_base_saved'):
-            logger.warning(
-                f"create_agent 400: Knowledge Base not saved for merchant_id={request.merchant_id} user_id={request.user_id}"
-            )
-            raise HTTPException(
-                status_code=400,
-                detail="Knowledge Base (Step 2) not saved. Please complete Step 2 first."
-            )
-        
+            logger.info(f"Knowledge Base not saved for merchant {request.merchant_id} — will skip document processing")
+
         # Collect all data from merchant record
         shop_name = request.shop_name or merchant.get('shop_name')
         shop_url = request.shop_url or merchant.get('shop_url')
@@ -2833,13 +2879,10 @@ async def update_agent(
                 detail="Agent not created yet. Please create agent first using POST /agents/create"
             )
         
-        # Validate knowledge base is saved
+        # Knowledge base is optional — if not saved, document processing will be skipped
         if not merchant.get('knowledge_base_saved'):
-            raise HTTPException(
-                status_code=400,
-                detail="Knowledge Base not saved. Please save knowledge base first using POST /agents/knowledge-base"
-            )
-        
+            logger.info(f"Knowledge Base not saved for merchant {request.merchant_id} — document processing will be skipped")
+
         # Create or reuse job in status tracker
         existing_status = status_tracker.get_status(request.merchant_id)
         if not existing_status:
@@ -2991,12 +3034,11 @@ async def process_agent_deletion(
 @app.delete("/agents/delete")
 async def delete_agent(
     request: DeleteAgentRequest,
+    background_tasks: BackgroundTasks,
     uid: str = Depends(verify_firebase_token)
 ):
     """
-    Soft-delete an agent — marks the merchant as deleted in the DB so it disappears
-    from the merchant list. All data (GCS files, embeddings, Vertex datastores) is
-    preserved and the merchant can be fully restored via POST /merchants/{id}/restore.
+    Permanently delete an agent and all associated data (DB, GCS, Vertex AI). NOT reversible.
     """
     if request.user_id != uid:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -3006,19 +3048,17 @@ async def delete_agent(
         if not merchant:
             raise HTTPException(status_code=404, detail="Merchant not found or access denied")
 
-        # Soft-delete synchronously — this persists immediately to DB regardless of
-        # what happens to background tasks (fixes Cloud Run background task kill issue)
-        deleted = soft_delete_merchant(request.merchant_id, request.user_id)
-        if not deleted:
-            raise HTTPException(status_code=500, detail="Failed to delete agent")
-
-        logger.info(f"Soft-deleted merchant {request.merchant_id} for user {request.user_id}")
-
+        # Delete everything: DB records, GCS files, Vertex AI datastores
+        background_tasks.add_task(
+            process_agent_deletion,
+            merchant_id=request.merchant_id,
+            user_id=request.user_id
+        )
+        logger.info(f"Permanent deletion initiated for merchant {request.merchant_id}")
         return {
             "merchant_id": request.merchant_id,
-            "status": "deleted",
-            "message": "Agent deleted successfully. You can restore it at any time.",
-            "restorable": True
+            "status": "deleting",
+            "message": "Agent is being permanently deleted. All data (files, embeddings, datastores) will be removed.",
         }
 
     except HTTPException:
@@ -3031,8 +3071,7 @@ async def delete_agent(
 @app.get("/merchants/deleted")
 async def list_deleted_merchants(uid: str = Depends(verify_firebase_token)):
     """
-    List all soft-deleted merchants for the current user.
-    Frontend can use this to show a 'Recently deleted' section with restore buttons.
+    List all deleted merchants for the current user (pending permanent deletion cleanup).
     """
     try:
         conn = None
@@ -3064,38 +3103,6 @@ async def list_deleted_merchants(uid: str = Depends(verify_firebase_token)):
 
     except Exception as e:
         logger.error(f"Error listing deleted merchants: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/merchants/{merchant_id}/restore")
-async def restore_agent(merchant_id: str, uid: str = Depends(verify_firebase_token)):
-    """
-    Restore a soft-deleted merchant using the Firebase token for user identification.
-    Since soft delete preserves all data (GCS files, embeddings, Vertex datastores),
-    the agent is fully functional after restore — no re-onboarding needed.
-    """
-    try:
-        restored = restore_merchant(merchant_id, uid)
-        if not restored:
-            raise HTTPException(
-                status_code=404,
-                detail="Merchant not found in deleted state or does not belong to this user"
-            )
-
-        merchant = get_merchant(merchant_id, uid)
-        logger.info(f"Restored merchant {merchant_id} for user {uid}")
-
-        return {
-            "merchant_id": merchant_id,
-            "status": "restored",
-            "message": "Agent restored successfully.",
-            "merchant": merchant
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error restoring agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3535,19 +3542,6 @@ async def get_merchant_info(merchant_id: str, uid: str = Depends(verify_firebase
     try:
         merchant = get_merchant(merchant_id, user_id)
         if not merchant:
-            # Check if it exists but is soft-deleted — return 410 with restore info
-            deleted_merchant = get_merchant_including_deleted(merchant_id, user_id)
-            if deleted_merchant and deleted_merchant.get('is_deleted'):
-                return JSONResponse(
-                    status_code=410,
-                    content={
-                        "status": "deleted",
-                        "merchant_id": merchant_id,
-                        "deleted_at": deleted_merchant.get('deleted_at').isoformat() if deleted_merchant.get('deleted_at') else None,
-                        "restorable": True,
-                        "message": "This agent has been deleted. You can restore it."
-                    }
-                )
             raise HTTPException(
                 status_code=404,
                 detail="Merchant not found or you don't have access"
@@ -3982,25 +3976,28 @@ async def get_merchant_config(merchant_id: str):
                         # Keep original URL if signed URL generation fails
                         config["branding"]["logo_signed_url"] = logo_url
             
-            # Check for logo in custom_chatbot - check both logo_signed_url and logo_url fields
+            # Generate signed URLs for all custom_chatbot images (logo, avatar, favicon)
             custom_chatbot = config.get("custom_chatbot", {})
-            logo_url = custom_chatbot.get("logo_signed_url") or custom_chatbot.get("logo_url")
-            if logo_url and logo_url.strip():  # Check if logo_url exists and is not empty
-                # Extract GCS path from public URL (validates merchant ownership)
-                logo_path = _extract_gcs_path_from_url(logo_url, merchant_id)
-                if logo_path:
-                    try:
-                        signed_url_info = gcs_handler.generate_download_url(logo_path, expiration_minutes=60)
-                        config["custom_chatbot"]["logo_signed_url"] = signed_url_info.get("download_url")
-                        config["custom_chatbot"]["logo_url_expires_in"] = signed_url_info.get("expires_in")
-                    except Exception as e:
-                        logger.warning(f"Failed to generate signed URL for custom_chatbot logo: {e}")
-                        # Keep original URL if signed URL generation fails
-                        config["custom_chatbot"]["logo_signed_url"] = logo_url
-                else:
-                    # If path extraction failed, keep original URL
-                    logger.warning(f"Could not extract GCS path from logo URL: {logo_url}")
-                    config["custom_chatbot"]["logo_signed_url"] = logo_url
+            _image_fields = [
+                ("logo_signed_url", "logo_url", "logo"),
+                ("chat_avatar_signed_url", "chat_avatar_url", "chat avatar"),
+                ("favicon_signed_url", "favicon_url", "favicon"),
+            ]
+            for signed_field, fallback_field, label in _image_fields:
+                img_url = custom_chatbot.get(signed_field) or custom_chatbot.get(fallback_field)
+                if img_url and img_url.strip():
+                    img_path = _extract_gcs_path_from_url(img_url, merchant_id)
+                    if img_path:
+                        try:
+                            signed_url_info = gcs_handler.generate_download_url(img_path, expiration_minutes=60)
+                            config["custom_chatbot"][signed_field] = signed_url_info.get("download_url")
+                            config["custom_chatbot"][f"{signed_field.replace('_signed_url', '')}_url_expires_in"] = signed_url_info.get("expires_in")
+                        except Exception as e:
+                            logger.warning(f"Failed to generate signed URL for {label}: {e}")
+                            config["custom_chatbot"][signed_field] = img_url
+                    else:
+                        logger.warning(f"Could not extract GCS path from {label} URL: {img_url}")
+                        config["custom_chatbot"][signed_field] = img_url
             
             # Add _is_default metadata to custom_chatbot for frontend
             if config.get("custom_chatbot"):
@@ -4265,47 +4262,34 @@ async def update_merchant_info(
 
 
 @app.delete("/merchants/{merchant_id}")
-async def delete_merchant_info(merchant_id: str, uid: str = Depends(verify_firebase_token)):
+async def delete_merchant_info(
+    merchant_id: str,
+    background_tasks: BackgroundTasks,
+    uid: str = Depends(verify_firebase_token)
+):
     """
-    Delete merchant and all associated data
-    
-    WARNING: This will delete:
-    - Merchant record from database
-    - All files in GCS (products, documents, configs)
-    - Vertex AI Search datastore (if exists)
-    - All onboarding job history
-    
-    Args:
-        merchant_id: Merchant identifier
-        user_id: User identifier (query parameter for security)
+    Permanently delete merchant and all associated data (DB, GCS, Vertex AI). NOT reversible.
     """
     try:
         user_id = uid
-        # Verify access first
         if not verify_merchant_access(merchant_id, user_id):
             raise HTTPException(
                 status_code=404,
                 detail="Merchant not found or you don't have access"
             )
-        
-        # Soft-delete synchronously so it persists immediately
-        success = soft_delete_merchant(merchant_id, user_id)
 
-        if not success:
-            raise HTTPException(
-                status_code=404,
-                detail="Merchant not found or you don't have access"
-            )
-
-        logger.info(f"Soft-deleted merchant {merchant_id} by user {user_id}")
-
+        background_tasks.add_task(
+            process_agent_deletion,
+            merchant_id=merchant_id,
+            user_id=user_id
+        )
+        logger.info(f"Permanent deletion initiated for merchant {merchant_id} by user {user_id}")
         return {
             "merchant_id": merchant_id,
-            "status": "deleted",
-            "message": "Merchant deleted successfully. You can restore it at any time.",
-            "restorable": True
+            "status": "deleting",
+            "message": "Merchant is being permanently deleted. All data will be removed.",
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:

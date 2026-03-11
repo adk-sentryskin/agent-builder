@@ -99,30 +99,6 @@ def get_merchant(merchant_id: str, user_id: Optional[str] = None) -> Optional[Di
             return_connection(conn)
 
 
-def get_merchant_including_deleted(merchant_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Get a merchant record regardless of soft-delete status.
-    Used to distinguish between 'deleted' and 'never existed'.
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute(
-            "SELECT * FROM merchants WHERE merchant_id = %s AND user_id = %s",
-            (merchant_id, user_id)
-        )
-        result = cursor.fetchone()
-        cursor.close()
-        return dict(result) if result else None
-    except Exception as e:
-        logger.error(f"Error getting merchant (including deleted): {e}")
-        return None
-    finally:
-        if conn:
-            return_connection(conn)
-
-
 def create_merchant(
     merchant_id: str,
     user_id: str,
@@ -182,6 +158,19 @@ def create_merchant(
                 values.append(custom_url_pattern)
                 placeholders.append('%s')
         
+        # Check if merchant_id is taken by a different user (even if soft-deleted)
+        cursor.execute(
+            "SELECT user_id, is_deleted FROM merchants WHERE merchant_id = %s",
+            (merchant_id,)
+        )
+        existing = cursor.fetchone()
+        if existing and existing[0] != user_id:
+            logger.warning(
+                f"Merchant {merchant_id} belongs to user {existing[0]}, "
+                f"cannot be claimed by {user_id}"
+            )
+            return False
+
         # Build INSERT ... ON CONFLICT query
         fields_str = ', '.join(fields)
         placeholders_str = ', '.join(placeholders)
@@ -195,6 +184,7 @@ def create_merchant(
             VALUES ({placeholders_str}, NOW(), NOW())
             ON CONFLICT (merchant_id) DO UPDATE
             SET {update_str},
+                is_deleted = FALSE,
                 updated_at = NOW()
         """
         
@@ -857,31 +847,48 @@ def delete_merchant(merchant_id: str, user_id: str) -> bool:
             
             # Check for shopify_stores table (may not exist in all databases)
             try:
+                cursor.execute("SAVEPOINT sp_count_shopify")
                 cursor.execute("""
-                    SELECT COUNT(*) FROM shopify_sync.shopify_stores 
+                    SELECT COUNT(*) FROM shopify_sync.shopify_stores
                     WHERE merchant_id = %s
                 """, (merchant_id,))
                 deleted_counts['shopify_stores'] = cursor.fetchone()[0]
+                cursor.execute("RELEASE SAVEPOINT sp_count_shopify")
             except Exception:
-                # Table or schema may not exist, skip
-                pass
+                cursor.execute("ROLLBACK TO SAVEPOINT sp_count_shopify")
             
             logger.info(f"Deleting merchant {merchant_id}: Related records to be cascade deleted: {deleted_counts}")
         except Exception as e:
             logger.warning(f"Could not count related records (may not exist): {e}")
         
-        # Delete from shopify_stores if it exists (may not have CASCADE constraint)
-        try:
-            cursor.execute("""
-                DELETE FROM shopify_sync.shopify_stores 
-                WHERE merchant_id = %s
-            """, (merchant_id,))
-            shopify_deleted = cursor.rowcount
-            if shopify_deleted > 0:
-                logger.info(f"Deleted {shopify_deleted} record(s) from shopify_sync.shopify_stores")
-        except Exception as e:
-            # Table or schema may not exist, or may have CASCADE - that's fine
-            logger.debug(f"Could not delete from shopify_stores (may not exist or have CASCADE): {e}")
+        # Delete from all platform-specific tables (no CASCADE constraints on these)
+        _cleanup_tables = [
+            ("shopify_sync.webhooks", "store_id IN (SELECT id FROM shopify_sync.shopify_stores WHERE merchant_id = %s)"),
+            ("shopify_sync.products", "store_id IN (SELECT id FROM shopify_sync.shopify_stores WHERE merchant_id = %s)"),
+            ("shopify_sync.shopify_stores", "merchant_id = %s"),
+            ("woocommerce_sync.webhooks", "store_id IN (SELECT id FROM woocommerce_sync.woocommerce_stores WHERE merchant_id = %s)"),
+            ("woocommerce_sync.products", "store_id IN (SELECT id FROM woocommerce_sync.woocommerce_stores WHERE merchant_id = %s)"),
+            ("woocommerce_sync.woocommerce_stores", "merchant_id = %s"),
+            ("squarespace_sync.squarespace_variants", "product_id IN (SELECT id FROM squarespace_sync.squarespace_products WHERE store_id IN (SELECT id FROM squarespace_sync.squarespace_stores WHERE merchant_id = %s))"),
+            ("squarespace_sync.squarespace_products", "store_id IN (SELECT id FROM squarespace_sync.squarespace_stores WHERE merchant_id = %s)"),
+            ("squarespace_sync.squarespace_stores", "merchant_id = %s"),
+            ("public.document_chunks", "merchant_id = %s"),
+            ("public.conversations", "merchant_id = %s"),
+        ]
+        for table, where_clause in _cleanup_tables:
+            sp_name = f"sp_{table.replace('.', '_')}"
+            try:
+                cursor.execute(f"SAVEPOINT {sp_name}")
+                cursor.execute(f"DELETE FROM {table} WHERE {where_clause}", (merchant_id,))
+                deleted = cursor.rowcount
+                if deleted > 0:
+                    logger.info(f"Deleted {deleted} record(s) from {table}")
+                cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except Exception as e:
+                # Table or schema may not exist — rollback only this savepoint
+                # This preserves all previous successful deletes in the transaction
+                logger.debug(f"Could not delete from {table}: {e}")
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
         
         # Delete merchant (CASCADE will automatically delete related records)
         # Tables with ON DELETE CASCADE:
@@ -920,100 +927,5 @@ def delete_merchant(merchant_id: str, user_id: str) -> bool:
             return_connection(conn)
 
 
-
-def soft_delete_merchant(merchant_id: str, user_id: str) -> bool:
-    """
-    Soft-delete a merchant — marks is_deleted=TRUE and sets deleted_at.
-    The merchant record, GCS files, embeddings, and Vertex datastores are preserved
-    so the merchant can be fully restored later.
-    """
-    conn = None
-    try:
-        if not verify_merchant_access(merchant_id, user_id):
-            logger.warning(f"User {user_id} does not have access to merchant {merchant_id}")
-            return False
-
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE merchants
-            SET is_deleted = TRUE,
-                deleted_at = NOW(),
-                updated_at = NOW()
-            WHERE merchant_id = %s AND user_id = %s
-              AND (is_deleted = FALSE OR is_deleted IS NULL)
-            """,
-            (merchant_id, user_id)
-        )
-        rows_updated = cursor.rowcount
-        conn.commit()
-        cursor.close()
-
-        if rows_updated > 0:
-            logger.info(f"Soft-deleted merchant {merchant_id} for user {user_id}")
-            return True
-        else:
-            logger.warning(f"Merchant {merchant_id} not found, not owned by {user_id}, or already deleted")
-            return False
-
-    except psycopg2.Error as e:
-        logger.error(f"Database error soft-deleting merchant: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    except Exception as e:
-        logger.error(f"Error soft-deleting merchant: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_connection(conn)
-
-
-def restore_merchant(merchant_id: str, user_id: str) -> bool:
-    """
-    Restore a soft-deleted merchant — clears is_deleted and deleted_at.
-    Since data is preserved on soft delete, the merchant is fully restored.
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE merchants
-            SET is_deleted = FALSE,
-                deleted_at = NULL,
-                updated_at = NOW()
-            WHERE merchant_id = %s AND user_id = %s AND is_deleted = TRUE
-            """,
-            (merchant_id, user_id)
-        )
-        rows_updated = cursor.rowcount
-        conn.commit()
-        cursor.close()
-
-        if rows_updated > 0:
-            logger.info(f"Restored merchant {merchant_id} for user {user_id}")
-            return True
-        else:
-            logger.warning(f"Merchant {merchant_id} not found in deleted state for user {user_id}")
-            return False
-
-    except psycopg2.Error as e:
-        logger.error(f"Database error restoring merchant: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    except Exception as e:
-        logger.error(f"Error restoring merchant: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_connection(conn)
 
 
