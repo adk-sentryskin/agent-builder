@@ -175,16 +175,35 @@ def validate_color(color: str) -> bool:
 
 def validate_position(position: str) -> bool:
     """
-    Validate chatbot position value
-    
+    Validate chatbot position value.
+
+    Accepts either a base position (e.g. 'bottom-right') or a custom offset
+    format 'base-position:horizontal:vertical' where offsets are integers in pixels
+    (e.g. 'bottom-right:30:200').
+
     Args:
         position: Position string
-    
+
     Returns:
         True if valid position, False otherwise
     """
+    if not position:
+        return False
     valid_positions = ['bottom-right', 'bottom-left', 'top-right', 'top-left', 'bottom-right-raised']
-    return position.lower() in valid_positions if position else False
+    parts = position.lower().split(':')
+    base = parts[0]
+    if base not in valid_positions:
+        return False
+    if len(parts) == 1:
+        return True
+    if len(parts) == 3:
+        try:
+            int(parts[1])
+            int(parts[2])
+            return True
+        except ValueError:
+            return False
+    return False
 
 
 def validate_logo_path(logo_path: str) -> Tuple[bool, Optional[str]]:
@@ -435,7 +454,7 @@ class SaveCustomChatbotRequest(BaseModel):
     @classmethod
     def validate_position_value(cls, v: Optional[str]) -> Optional[str]:
         if v and not validate_position(v):
-            raise ValueError('Invalid position. Must be one of: bottom-right, bottom-left, top-right, top-left, bottom-right-raised')
+            raise ValueError('Invalid position. Use a base position (bottom-right, bottom-left, top-right, top-left, bottom-right-raised) or custom offset format (e.g. bottom-right:30:200)')
         return v
     
     @field_validator('logo_path')
