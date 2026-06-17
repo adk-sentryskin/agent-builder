@@ -377,7 +377,7 @@ class SaveAIPersonaRequest(BaseModel):
     store_name: str = Field(..., description="Store Name (used to generate merchant_id if not provided)")
     shop_url: str = Field(..., description="Shop URL")
     tone_of_voice: Optional[str] = Field(None, description="Tone of Voice (e.g., Friendly)")
-    platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, squarespace, custom)")
+    platform: Optional[str] = Field(None, description="Where is your site hosted? (shopify, woocommerce, wordpress, squarespace, shopline, custom)")
     top_questions: Optional[List[str]] = Field(None, description="Top-3 Questions (array of 3 questions)")
     top_products: List[str] = Field(..., description="Top-3 product links to sell/promote")
     customer_persona: str = Field(..., description="Describe your ideal customer persona")
@@ -485,7 +485,7 @@ class OnboardRequest(BaseModel):
     logo_url: Optional[str] = None
     platform: Optional[str] = Field(
         None,
-        description="E-commerce platform type: 'shopify', 'woocommerce', 'wordpress', 'squarespace', or 'custom'. If not provided, will auto-detect from shop_url."
+        description="E-commerce platform type: 'shopify', 'woocommerce', 'wordpress', 'squarespace', 'shopline', or 'custom'. If not provided, will auto-detect from shop_url."
     )
     custom_url_pattern: Optional[str] = Field(
         None,
@@ -996,6 +996,8 @@ async def process_onboarding(
                     _pc_cur.execute("SELECT COUNT(*) FROM woocommerce_sync.products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
                 elif platform and platform.strip().lower() == 'squarespace':
                     _pc_cur.execute("SELECT COUNT(*) FROM squarespace_sync.squarespace_products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
+                elif platform and platform.strip().lower() == 'shopline':
+                    _pc_cur.execute("SELECT COUNT(*) FROM shopline_sync.shopline_products WHERE merchant_id = %s AND is_deleted = 0", (merchant_id,))
                 _product_count = (_pc_cur.fetchone() or [0])[0]
                 _pc_cur.close()
                 return_connection(_pc_conn)
